@@ -19,21 +19,44 @@ class Settings:
     discord_enabled: bool = False
     discord_app_id: str = ""
     volume: int = 80
+    sleep_preset_minutes: int = 30
+    mini_mode_default: bool = False
+    # "theme" = use theme default, "on" = always show, "off" = never show
+    show_thumbnails: str = "theme"
+    # Empty = auto-detect default sink monitor; otherwise PulseAudio source name.
+    audio_device: str = ""
+    listenbrainz_enabled: bool = False
+    listenbrainz_token: str = ""
+    layout: str = "classic"
+    layout_overrides: dict = field(default_factory=dict)
+    adaptive_accent: bool = False
 
 
 def _to_toml(s: Settings) -> str:
     out: list[str] = []
+    tables: list[str] = []
     for f in fields(s):
         val = getattr(s, f.name)
         if isinstance(val, bool):
             out.append(f"{f.name} = {'true' if val else 'false'}")
         elif isinstance(val, (int, float)):
             out.append(f"{f.name} = {val}")
+        elif isinstance(val, dict):
+            # Serialize as a [table] at the bottom.
+            tables.append(f"\n[{f.name}]")
+            for k, v in val.items():
+                if isinstance(v, bool):
+                    tables.append(f"{k} = {'true' if v else 'false'}")
+                elif isinstance(v, (int, float)):
+                    tables.append(f"{k} = {v}")
+                else:
+                    sv = str(v).replace("\\", "\\\\").replace('"', '\\"')
+                    tables.append(f'{k} = "{sv}"')
         else:
             # naive string quoting — values are alphanumeric/punctuation only here
             escaped = str(val).replace("\\", "\\\\").replace('"', '\\"')
             out.append(f'{f.name} = "{escaped}"')
-    return "\n".join(out) + "\n"
+    return "\n".join(out) + "\n" + "\n".join(tables) + ("\n" if tables else "")
 
 
 def load() -> Settings:

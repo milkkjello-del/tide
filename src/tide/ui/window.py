@@ -4,6 +4,7 @@ from __future__ import annotations
 from PySide6.QtCore import (
     QObject,
     QThread,
+    QTimer,
     Qt,
     QUrl,
     Signal,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QScrollArea,
     QSizePolicy,
     QStackedWidget,
     QStatusBar,
@@ -33,11 +35,24 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import api, theming
+from .. import api, history as history_module, layout as layout_module, session as session_module, theming
 from ..player import PlayState, Player
 from ..queue import Queue, Role
+from .album import AlbumView
+from .artist import ArtistView
+from .explore import ExploreView
+from .history import HistoryView
 from .library import LibraryView
 from .lyrics import LyricsView
+from .track_row import TrackRowDelegate
+from .variants import (
+    make_album_art,
+    make_controls,
+    make_now_label,
+    make_progress,
+    make_volume,
+)
+from .visualizer import VisualizerView
 from .widgets import AlbumArt, BracketButton, MonoProgress, MonoVolume, NowPlayingLabel
 
 
@@ -45,17 +60,26 @@ from .widgets import AlbumArt, BracketButton, MonoProgress, MonoVolume, NowPlayi
 
 
 class _SearchWorker(QObject):
-    done = Signal(list)
+    done = Signal(str, list)        # filter, results
     failed = Signal(str)
 
-    def __init__(self, api_obj: api.Api, query: str) -> None:
+    def __init__(self, api_obj: api.Api, query: str, filter_: str) -> None:
         super().__init__()
         self.api = api_obj
         self.query = query
+        self.filter = filter_
 
     def run(self) -> None:
         try:
-            self.done.emit(self.api.search_songs(self.query))
+            if self.filter == "albums":
+                out = self.api.search_albums(self.query)
+            elif self.filter == "artists":
+                out = self.api.search_artists(self.query)
+            elif self.filter == "videos":
+                out = self.api.search_videos(self.query)
+            else:
+                out = self.api.search_songs(self.query)
+            self.done.emit(self.filter, out)
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -93,6 +117,24 @@ class _RadioWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class _RateWorker(QObject):
+    done = Signal(str, bool)        # video_id, new_liked_state
+    failed = Signal(str, str)       # video_id, msg
+
+    def __init__(self, api_obj: api.Api, video_id: str, liked: bool) -> None:
+        super().__init__()
+        self.api = api_obj
+        self.video_id = video_id
+        self.liked = liked
+
+    def run(self) -> None:
+        try:
+            self.api.rate_song(self.video_id, self.liked)
+            self.done.emit(self.video_id, self.liked)
+        except Exception as exc:
+            self.failed.emit(self.video_id, str(exc))
+
+
 # ---------- main window ----------
 
 
@@ -112,10 +154,31 @@ class MainWindow(QMainWindow):
         self._resolve_worker: _ResolveWorker | None = None
         self._radio_thread: QThread | None = None
         self._radio_worker: _RadioWorker | None = None
+        self._rate_thread: QThread | None = None
+        self._rate_worker: _RateWorker | None = None
+        self._liked_current: bool = False
+        self._mini_mode: bool = False
+        self._geometry_before_mini = None
+        self._upper_wrap_widget = None
+
+        # Sleep timer state
+        self._sleep_mode = None              # SleepMode or None
+        self._sleep_deadline: float | None = None
+        self._sleep_timer = QTimer(self)
+        self._sleep_timer.setInterval(1000)
+        self._sleep_timer.timeout.connect(self._on_sleep_tick)
 
         self._current: api.Track | None = None
         self._auto_radio_on_play = True   # play-now seeds a radio by default
         self._last_position: float = 0.0
+        self._restoring_session: bool = False
+        self._session_dirty: bool = False
+
+        # Debounced session save — fires ~2s after the last change.
+        self._session_save_timer = QTimer(self)
+        self._session_save_timer.setSingleShot(True)
+        self._session_save_timer.setInterval(2000)
+        self._session_save_timer.timeout.connect(self._save_session_now)
 
         self._net = QNetworkAccessManager(self)
         self._art_for_video_id: str | None = None
@@ -133,23 +196,32 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         # ----- nav rail -----
         self.nav_search_btn = BracketButton("search")
+        self.nav_explore_btn = BracketButton("explore")
         self.nav_library_btn = BracketButton("library")
         self.nav_queue_btn = BracketButton("queue")
         self.nav_lyrics_btn = BracketButton("lyrics")
+        self.nav_history_btn = BracketButton("history")
+        self.nav_visualizer_btn = BracketButton("visualizer")
         self.nav_settings_btn = BracketButton("settings")
         self.nav_search_btn.clicked.connect(lambda: self._switch_view("search"))
+        self.nav_explore_btn.clicked.connect(lambda: self._switch_view("explore"))
         self.nav_library_btn.clicked.connect(lambda: self._switch_view("library"))
         self.nav_queue_btn.clicked.connect(lambda: self._switch_view("queue"))
         self.nav_lyrics_btn.clicked.connect(lambda: self._switch_view("lyrics"))
+        self.nav_history_btn.clicked.connect(lambda: self._switch_view("history"))
+        self.nav_visualizer_btn.clicked.connect(lambda: self._switch_view("visualizer"))
         self.nav_settings_btn.clicked.connect(self.open_settings)
 
         nav_col = QVBoxLayout()
         nav_col.setContentsMargins(10, 14, 10, 14)
         nav_col.setSpacing(2)
         nav_col.addWidget(self.nav_search_btn)
+        nav_col.addWidget(self.nav_explore_btn)
         nav_col.addWidget(self.nav_library_btn)
         nav_col.addWidget(self.nav_queue_btn)
         nav_col.addWidget(self.nav_lyrics_btn)
+        nav_col.addWidget(self.nav_history_btn)
+        nav_col.addWidget(self.nav_visualizer_btn)
         nav_col.addStretch(1)
         nav_col.addWidget(self.nav_settings_btn)
         nav = QFrame()
@@ -167,18 +239,58 @@ class MainWindow(QMainWindow):
         self.heading.setProperty("class", "dim")
         self.heading.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
+        # Search filter tabs (songs/videos/albums/artists).
+        self.search_tab_songs = BracketButton("songs")
+        self.search_tab_videos = BracketButton("videos")
+        self.search_tab_albums = BracketButton("albums")
+        self.search_tab_artists = BracketButton("artists")
+        self._search_filter = "songs"
+        for btn, name in (
+            (self.search_tab_songs, "songs"),
+            (self.search_tab_videos, "videos"),
+            (self.search_tab_albums, "albums"),
+            (self.search_tab_artists, "artists"),
+        ):
+            btn.clicked.connect(lambda _=False, n=name: self._set_search_filter(n))
+
+        tabs_row = QHBoxLayout()
+        tabs_row.setContentsMargins(0, 0, 0, 0)
+        tabs_row.setSpacing(2)
+        tabs_row.addWidget(self.search_tab_songs)
+        tabs_row.addWidget(self.search_tab_videos)
+        tabs_row.addWidget(self.search_tab_albums)
+        tabs_row.addWidget(self.search_tab_artists)
+        tabs_row.addStretch(1)
+
         self.results = QListWidget()
         self.results.itemActivated.connect(self._on_result_activated)
         self.results.setUniformItemSizes(True)
         self.results.setContextMenuPolicy(Qt.CustomContextMenu)
         self.results.customContextMenuRequested.connect(self._on_results_menu)
+        self._track_delegate = TrackRowDelegate(self)
+        self._track_delegate.attach(self.results)
+        self.results.setItemDelegate(self._track_delegate)
+
+        # Card grid used by [albums] and [artists] tabs.
+        from .card import CardGrid
+        self.results_cards = CardGrid()
+        self.results_cards.setVisible(False)
+
+        results_scroll = QScrollArea()
+        results_scroll.setWidget(self.results_cards)
+        results_scroll.setWidgetResizable(True)
+        results_scroll.setFrameShape(QScrollArea.NoFrame)
+        results_scroll.setVisible(False)
+        self._results_card_scroll = results_scroll
 
         search_col = QVBoxLayout()
         search_col.setContentsMargins(16, 14, 16, 8)
         search_col.setSpacing(8)
         search_col.addWidget(self.search)
+        search_col.addLayout(tabs_row)
         search_col.addWidget(self.heading)
         search_col.addWidget(self.results, stretch=1)
+        search_col.addWidget(results_scroll, stretch=1)
         search_view = QWidget()
         search_view.setLayout(search_col)
 
@@ -192,6 +304,15 @@ class MainWindow(QMainWindow):
         self.queue_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.queue_view.customContextMenuRequested.connect(self._on_queue_menu)
         self.queue_view.doubleClicked.connect(self._on_queue_double)
+        self.queue_view.setDragDropMode(QListView.InternalMove)
+        self.queue_view.setDefaultDropAction(Qt.MoveAction)
+        self.queue_view.setSelectionMode(QListView.SingleSelection)
+        self.queue_view.setMovement(QListView.Snap)
+        self.queue_view.setDragEnabled(True)
+        self.queue_view.setAcceptDrops(True)
+        self.queue_view.setDropIndicatorShown(True)
+        self._track_delegate.attach(self.queue_view)
+        self.queue_view.setItemDelegate(self._track_delegate)
 
         self.radio_btn = BracketButton("radio: off")
         self.radio_btn.clicked.connect(self._on_radio_toggle)
@@ -224,12 +345,62 @@ class MainWindow(QMainWindow):
         # ----- lyrics view -----
         self.lyrics_view = LyricsView(self.api)
 
+        # ----- history view -----
+        self.history_view = HistoryView()
+        self.history_view.play_now_requested.connect(self._play_now)
+        self.history_view.queue_add_requested.connect(self._queue_add)
+        self.history_view.radio_requested.connect(self._start_radio)
+        self.history_view.status_message.connect(self._set_status)
+
+        # ----- explore + album + artist views -----
+        self.explore_view = ExploreView(self.api)
+        self.explore_view.play_now_requested.connect(self._play_now)
+        self.explore_view.queue_add_requested.connect(self._queue_add)
+        self.explore_view.radio_requested.connect(self._start_radio)
+        self.explore_view.album_requested.connect(self._open_album_entry)
+        self.explore_view.artist_requested.connect(self._open_artist_entry)
+        self.explore_view.playlist_requested.connect(self._open_playlist_entry)
+        self.explore_view.status_message.connect(self._set_status)
+
+        self.album_view = AlbumView(self.api)
+        self.album_view.back_requested.connect(self._go_back)
+        self.album_view.play_now_requested.connect(self._play_now)
+        self.album_view.queue_add_requested.connect(self._queue_add)
+        self.album_view.queue_next_requested.connect(self._queue_next)
+        self.album_view.radio_requested.connect(self._start_radio)
+        self.album_view.play_all_requested.connect(self._play_all)
+        self.album_view.artist_requested.connect(self._open_artist_by_name)
+        self.album_view.status_message.connect(self._set_status)
+
+        self.artist_view = ArtistView(self.api)
+        self.artist_view.back_requested.connect(self._go_back)
+        self.artist_view.play_now_requested.connect(self._play_now)
+        self.artist_view.queue_add_requested.connect(self._queue_add)
+        self.artist_view.queue_next_requested.connect(self._queue_next)
+        self.artist_view.radio_requested.connect(self._start_radio)
+        self.artist_view.play_all_requested.connect(self._play_all)
+        self.artist_view.album_requested.connect(self._open_album_entry)
+        self.artist_view.artist_requested.connect(self._open_artist_entry)
+        self.artist_view.status_message.connect(self._set_status)
+
+        # ----- visualizer view -----
+        self.visualizer_view = VisualizerView()
+        self.visualizer_view.status_message.connect(self._set_status)
+
         # ----- stack -----
         self.stack = QStackedWidget()
-        self.stack.addWidget(search_view)        # 0
-        self.stack.addWidget(self.library_view)  # 1
-        self.stack.addWidget(queue_view)         # 2
-        self.stack.addWidget(self.lyrics_view)   # 3
+        self.stack.addWidget(search_view)            # 0
+        self.stack.addWidget(self.library_view)      # 1
+        self.stack.addWidget(queue_view)             # 2
+        self.stack.addWidget(self.lyrics_view)       # 3
+        self.stack.addWidget(self.history_view)      # 4
+        self.stack.addWidget(self.explore_view)      # 5
+        self.stack.addWidget(self.album_view)        # 6
+        self.stack.addWidget(self.artist_view)       # 7
+        self.stack.addWidget(self.visualizer_view)   # 8
+
+        # Simple back stack of previous indices so AlbumView/ArtistView can pop.
+        self._view_history: list[int] = []
 
         upper = QHBoxLayout()
         upper.setContentsMargins(0, 0, 0, 0)
@@ -238,25 +409,47 @@ class MainWindow(QMainWindow):
         upper.addWidget(self.stack, stretch=1)
         upper_wrap = QWidget()
         upper_wrap.setLayout(upper)
+        self._upper_wrap_widget = upper_wrap
 
         # ----- now-playing strip -----
-        self.art = AlbumArt(96)
-        self.now_label = NowPlayingLabel()
+        # Slot variants come from the active layout. Falls back to v1 defaults
+        # if no layout has been applied yet.
+        layout = layout_module.manager().current()
+        self._slot_album_art = layout.slots.get("album_art", "square")
+        self._slot_now_label = layout.slots.get("now_label", "stacked")
+        self._slot_progress = layout.slots.get("progress", "blocks")
+        self._slot_volume = layout.slots.get("volume", "blocks")
+        self._slot_controls = layout.slots.get("controls", "bracket")
 
-        self.prev_btn = BracketButton("prev", glyph="◂◂")
-        self.play_btn = BracketButton("play", glyph="▶")
-        self.next_btn = BracketButton("next", glyph="▸▸")
+        self.art = make_album_art(self._slot_album_art, 96)
+        # Double-click art = mini-mode toggle.
+        def _art_double_click(_ev):
+            self.toggle_mini_mode()
+        self.art.mouseDoubleClickEvent = _art_double_click   # type: ignore[assignment]
+        self.now_label = make_now_label(self._slot_now_label)
+        self.up_next = QLabel("")
+        self.up_next.setProperty("class", "dim")
+        self.up_next.setVisible(False)
+        self.up_next.setContentsMargins(0, 0, 0, 2)
+
+        self._controls_bundle = make_controls(self._slot_controls)
+        self.prev_btn = self._controls_bundle.prev_btn
+        self.play_btn = self._controls_bundle.play_btn
+        self.next_btn = self._controls_bundle.next_btn
+        self.like_btn = self._controls_bundle.like_btn
         self.prev_btn.clicked.connect(self._on_prev_clicked)
         self.play_btn.clicked.connect(self._on_play_clicked)
         self.next_btn.clicked.connect(self._on_next_clicked)
+        self.like_btn.clicked.connect(self._on_like_clicked)
         self.prev_btn.setEnabled(False)
         self.next_btn.setEnabled(False)
         self.play_btn.setEnabled(False)
+        self.like_btn.setEnabled(False)
 
-        self.progress = MonoProgress()
+        self.progress = make_progress(self._slot_progress)
         self.progress.seek_requested.connect(self.player.seek)
 
-        self.volume = MonoVolume()
+        self.volume = make_volume(self._slot_volume)
         self.volume.volume_changed.connect(self._on_volume_changed)
 
         self.time_label = QLabel("0:00 / 0:00")
@@ -264,37 +457,12 @@ class MainWindow(QMainWindow):
         self.time_label.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
         self.time_label.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
 
-        controls_row = QHBoxLayout()
-        controls_row.setContentsMargins(0, 0, 0, 0)
-        controls_row.setSpacing(2)
-        controls_row.addWidget(self.prev_btn)
-        controls_row.addWidget(self.play_btn)
-        controls_row.addWidget(self.next_btn)
-        controls_row.addStretch(1)
-        controls_row.addWidget(self.volume)
-
-        progress_row = QHBoxLayout()
-        progress_row.setContentsMargins(0, 0, 0, 0)
-        progress_row.setSpacing(8)
-        progress_row.addWidget(self.progress, stretch=1)
-        progress_row.addWidget(self.time_label)
-
-        right_col = QVBoxLayout()
-        right_col.setContentsMargins(0, 0, 0, 0)
-        right_col.setSpacing(6)
-        right_col.addWidget(self.now_label, stretch=1)
-        right_col.addLayout(progress_row)
-        right_col.addLayout(controls_row)
-
-        strip_layout = QHBoxLayout()
-        strip_layout.setContentsMargins(16, 12, 16, 12)
-        strip_layout.setSpacing(14)
-        strip_layout.addWidget(self.art)
-        strip_layout.addLayout(right_col, stretch=1)
+        strip_layout = self._build_classic_strip_layout()
         strip = QFrame()
         strip.setObjectName("now_playing")
         strip.setLayout(strip_layout)
         strip.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.strip = strip
 
         # ----- assemble -----
         root = QVBoxLayout()
@@ -309,8 +477,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("ready")
 
     def _line_heading(self, label: str, total: int = 60) -> str:
-        line = "─" * max(4, total - len(label) - 6)
-        return f"── {label.lower()} {line}"
+        styled = theming.styled_case(label)
+        line = "─" * max(4, total - len(styled) - 6)
+        return f"── {styled} {line}"
 
     def _set_status(self, msg: str) -> None:
         self.statusBar().showMessage(msg)
@@ -318,6 +487,9 @@ class MainWindow(QMainWindow):
     # ---------- nav ----------
 
     def _switch_view(self, name: str) -> None:
+        # Recording the previous root view for the back-stack — never push
+        # transient detail pages.
+        prev = self.stack.currentIndex()
         if name == "search":
             self.stack.setCurrentIndex(0)
             self.search.setFocus()
@@ -330,6 +502,30 @@ class MainWindow(QMainWindow):
         elif name == "lyrics":
             self.stack.setCurrentIndex(3)
             self.lyrics_view.show_for(self._current)
+        elif name == "history":
+            self.stack.setCurrentIndex(4)
+            self.history_view.reload()
+        elif name == "explore":
+            self.stack.setCurrentIndex(5)
+            self.explore_view.ensure_loaded()
+        elif name == "visualizer":
+            self.stack.setCurrentIndex(8)
+        # Reset back-stack on root-level navigation so [back] doesn't
+        # bounce between top-level views.
+        if prev in (6, 7) and self.stack.currentIndex() not in (6, 7):
+            self._view_history.clear()
+
+    def _push_view(self, target_index: int) -> None:
+        if self.stack.currentIndex() != target_index:
+            self._view_history.append(self.stack.currentIndex())
+            self.stack.setCurrentIndex(target_index)
+
+    def _go_back(self) -> None:
+        if self._view_history:
+            self.stack.setCurrentIndex(self._view_history.pop())
+        else:
+            # Fallback: go to search.
+            self.stack.setCurrentIndex(0)
 
     # ---------- search ----------
 
@@ -339,10 +535,11 @@ class MainWindow(QMainWindow):
             return
         self.heading.setText(self._line_heading(f"searching “{q}”"))
         self.results.clear()
-        self.statusBar().showMessage(f"searching: {q}")
+        self.results_cards.clear()
+        self.statusBar().showMessage(f"searching {self._search_filter}: {q}")
 
         thread = QThread(self)
-        worker = _SearchWorker(self.api, q)
+        worker = _SearchWorker(self.api, q, self._search_filter)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.done.connect(self._on_results)
@@ -355,25 +552,54 @@ class MainWindow(QMainWindow):
         self._search_worker = worker
         thread.start()
 
-    def _on_results(self, tracks: list[api.Track]) -> None:
-        marker = self._list_marker()
-        if not tracks:
+    def _set_search_filter(self, name: str) -> None:
+        if name == self._search_filter:
+            return
+        self._search_filter = name
+        # Re-run with the new filter if there's an active query.
+        if self.search.text().strip():
+            self._on_search()
+
+    def _on_results(self, filter_: str, items: list) -> None:
+        # Filter could have changed since this query started — discard stale.
+        if filter_ != self._search_filter:
+            return
+        if not items:
             self.heading.setText(self._line_heading("no results"))
             self.statusBar().showMessage("no results")
             return
-        self.heading.setText(self._line_heading(f"results · {len(tracks)}"))
-        self.statusBar().showMessage(f"{len(tracks)} results")
-        for tr in tracks:
-            artist = (tr.artists or "").lower()
-            title = (tr.title or "").lower()
-            dur = tr.duration or ""
-            label = f"{marker}{artist} — {title}"
-            if dur:
-                gap = max(2, 60 - len(label) - len(dur))
-                label = f"{label}{' ' * gap}{dur}"
-            item = QListWidgetItem(label)
-            item.setData(Qt.UserRole, tr)
-            self.results.addItem(item)
+        self.heading.setText(self._line_heading(f"results · {len(items)}"))
+        self.statusBar().showMessage(f"{len(items)} results")
+
+        is_cards = filter_ in ("albums", "artists")
+        self.results.setVisible(not is_cards)
+        self._results_card_scroll.setVisible(is_cards)
+
+        if not is_cards:
+            marker = self._list_marker()
+            for tr in items:
+                artist = theming.styled_case(tr.artists or "")
+                title = theming.styled_case(tr.title or "")
+                dur = tr.duration or ""
+                label = f"{marker}{artist} — {title}"
+                if dur:
+                    gap = max(2, 60 - len(label) - len(dur))
+                    label = f"{label}{' ' * gap}{dur}"
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, tr)
+                self.results.addItem(item)
+            return
+
+        # Cards (albums or artists).
+        from .card import Card
+        for entry in items:
+            if filter_ == "albums":
+                c = Card(entry.title, entry.artists, entry.thumbnail, entry)
+                c.clicked.connect(self._open_album_entry)
+            else:
+                c = Card(entry.name, "artist", entry.thumbnail, entry, circular=True)
+                c.clicked.connect(self._open_artist_entry)
+            self.results_cards.add_card(c)
 
     def _on_search_failed(self, msg: str) -> None:
         self.heading.setText(self._line_heading("search failed"))
@@ -398,12 +624,14 @@ class MainWindow(QMainWindow):
         a_next = QAction("play next", menu)
         a_add  = QAction("add to queue", menu)
         a_radio = QAction("start radio from here", menu)
-        for a in (a_play, a_next, a_add, a_radio):
+        a_artist = QAction("view artist", menu)
+        for a in (a_play, a_next, a_add, a_radio, a_artist):
             menu.addAction(a)
         a_play.triggered.connect(lambda: self._play_now(tr, seed_radio=False))
         a_next.triggered.connect(lambda: self._queue_next(tr))
         a_add.triggered.connect(lambda: self._queue_add(tr))
         a_radio.triggered.connect(lambda: self._start_radio(tr))
+        a_artist.triggered.connect(lambda: self._open_artist_by_name(tr.artists))
         menu.exec(self.results.viewport().mapToGlobal(pos))
 
     # ---------- queue interactions ----------
@@ -443,7 +671,7 @@ class MainWindow(QMainWindow):
 
     # ---------- queue actions ----------
 
-    def _play_now(self, track: api.Track, *, seed_radio: bool) -> None:
+    def _play_now(self, track: api.Track, seed_radio: bool = False) -> None:
         # Replace queue with just this track, set current, play it. If
         # seed_radio is true, also turn radio on so the queue refills.
         self.queue.blockSignals(True)
@@ -472,6 +700,84 @@ class MainWindow(QMainWindow):
     def _start_radio(self, track: api.Track) -> None:
         self._play_now(track, seed_radio=True)
         self.statusBar().showMessage("radio started")
+
+    def _toggle_visualizer_fullscreen(self) -> None:
+        # F11 only meaningful when the visualizer is the active view.
+        if self.stack.currentIndex() == 8:
+            self.visualizer_view._toggle_fullscreen()
+
+    # ---------- discovery navigation ----------
+
+    def _open_album_entry(self, entry: api.AlbumEntry) -> None:
+        if not entry:
+            return
+        self.album_view.open_album(entry.browse_id, title_hint=entry.title, thumbnail_hint=entry.thumbnail)
+        self._push_view(6)
+
+    def _open_album_browse_id(self, browse_id: str) -> None:
+        if not browse_id:
+            return
+        self.album_view.open_album(browse_id)
+        self._push_view(6)
+
+    def _open_artist_entry(self, entry: api.ArtistEntry) -> None:
+        if not entry:
+            return
+        self.artist_view.open_artist(entry.channel_id, name_hint=entry.name, thumbnail_hint=entry.thumbnail)
+        self._push_view(7)
+
+    def _open_artist_by_id(self, channel_id: str) -> None:
+        if not channel_id:
+            return
+        self.artist_view.open_artist(channel_id)
+        self._push_view(7)
+
+    def _open_artist_by_name(self, name: str) -> None:
+        """Album view fires this with an artist name string. Look up the top
+        match in the background and open the first hit."""
+        if not name:
+            return
+        from PySide6.QtCore import QObject as _QO, QThread as _QT, Signal as _QSig
+        class _LookupWorker(_QO):
+            found = _QSig(object)
+            failed = _QSig(str)
+            def __init__(self, api_obj, name):
+                super().__init__()
+                self.api = api_obj
+                self.name = name
+            def run(self):
+                try:
+                    arts = self.api.search_artists(self.name, limit=1)
+                    self.found.emit(arts[0] if arts else None)
+                except Exception as e:
+                    self.failed.emit(str(e))
+        thread = _QT(self)
+        worker = _LookupWorker(self.api, name)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        def on_found(entry):
+            if entry is not None:
+                self._open_artist_entry(entry)
+            else:
+                self.statusBar().showMessage(f"no artist found for {name!r}")
+        worker.found.connect(on_found)
+        worker.failed.connect(lambda m: self.statusBar().showMessage(f"artist lookup failed: {m}"))
+        worker.found.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        # Hold refs so they don't GC.
+        self._artist_lookup_thread = thread
+        self._artist_lookup_worker = worker
+        thread.start()
+
+    def _open_playlist_entry(self, entry: api.PlaylistEntry) -> None:
+        # Hand off to the library view's detail page, then switch to it.
+        if not entry:
+            return
+        self.library_view.open_playlist(entry)
+        # Keep library nav highlighted; LibraryView handles internal detail.
+        self.stack.setCurrentIndex(1)
 
     def _play_all(self, tracks: list[api.Track]) -> None:
         """Replace queue with `tracks`, start the first one. No radio seed —
@@ -506,6 +812,13 @@ class MainWindow(QMainWindow):
         self.time_label.setText("0:00 / 0:00")
         self.statusBar().showMessage("resolving stream…")
         self._fetch_art(track)
+        # Log to history. Skip if we're restoring a session — that's a resume,
+        # not a fresh play.
+        if not self._restoring_session:
+            try:
+                history_module.append(track)
+            except Exception:
+                pass
 
         thread = QThread(self)
         worker = _ResolveWorker(track.video_id)
@@ -528,6 +841,10 @@ class MainWindow(QMainWindow):
         self.now_label.setStatus("")
         self.statusBar().showMessage("playing")
         self.play_btn.setEnabled(True)
+        self.like_btn.setEnabled(True)
+        # Best-effort like-state lookup in the background; UI defaults to ♡.
+        self._liked_current = False
+        self._refresh_like_button()
         self._refresh_nav_buttons()
         # If lyrics is the active view, refresh it for the new track.
         if self.stack.currentIndex() == 3:
@@ -536,10 +853,52 @@ class MainWindow(QMainWindow):
     def _on_resolve_failed(self, video_id: str, msg: str) -> None:
         self.statusBar().showMessage(f"couldn't resolve: {msg}")
         self.now_label.setStatus("error")
-        QMessageBox.warning(self, "tide", f"couldn't get audio:\n\n{msg}")
+        from .toast import show_toast
+        show_toast(self, f"couldn't get audio · {msg[:80]}")
 
     def _on_play_clicked(self) -> None:
         self.player.toggle()
+
+    def _on_like_clicked(self) -> None:
+        if not self._current:
+            return
+        target = not self._liked_current
+        # Optimistic UI flip.
+        self._liked_current = target
+        self._refresh_like_button()
+        self.like_btn.setEnabled(False)
+
+        thread = QThread(self)
+        worker = _RateWorker(self.api, self._current.video_id, target)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(self._on_rate_done)
+        worker.failed.connect(self._on_rate_failed)
+        worker.done.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._rate_thread = thread
+        self._rate_worker = worker
+        thread.start()
+
+    def _on_rate_done(self, video_id: str, liked: bool) -> None:
+        if self._current and self._current.video_id == video_id:
+            self.statusBar().showMessage("liked" if liked else "removed like")
+            self.like_btn.setEnabled(True)
+
+    def _on_rate_failed(self, video_id: str, msg: str) -> None:
+        # Revert optimistic flip.
+        if self._current and self._current.video_id == video_id:
+            self._liked_current = not self._liked_current
+            self._refresh_like_button()
+            self.like_btn.setEnabled(True)
+        self.statusBar().showMessage(f"couldn't update like: {msg}")
+
+    def _refresh_like_button(self) -> None:
+        glyph = "♥" if self._liked_current else "♡"
+        self.like_btn.setLabel(glyph)
+        self.like_btn.setGlyph(glyph)
 
     def _on_next_clicked(self) -> None:
         tr = self.queue.advance()
@@ -568,19 +927,42 @@ class MainWindow(QMainWindow):
         self.queue.rowsInserted.connect(self._on_queue_size_changed)
         self.queue.rowsRemoved.connect(self._on_queue_size_changed)
         self.queue.modelReset.connect(lambda: self._on_queue_size_changed(None, 0, 0))
+        # Persist session on any meaningful queue change.
+        self.queue.current_changed.connect(lambda _t: self._schedule_session_save())
+        self.queue.rowsInserted.connect(lambda *_a: self._schedule_session_save())
+        self.queue.rowsRemoved.connect(lambda *_a: self._schedule_session_save())
+        self.queue.modelReset.connect(self._schedule_session_save)
+        self.queue.radio_state_changed.connect(lambda _e: self._schedule_session_save())
 
     def _on_queue_size_changed(self, *_args) -> None:
         self.queue_heading.setText(
             self._line_heading(f"queue · {self.queue.rowCount()}")
         )
         self._refresh_nav_buttons()
+        self._refresh_up_next()
 
     def _on_queue_current_changed(self, _track) -> None:
         self._refresh_nav_buttons()
+        self._refresh_up_next()
+
+    def _refresh_up_next(self) -> None:
+        nxt_idx = self.queue.current_index + 1
+        if 0 < nxt_idx < self.queue.rowCount():
+            tr = self.queue.tracks[nxt_idx]
+            artist = theming.styled_case(tr.artists or "")
+            title = theming.styled_case(tr.title or "")
+            self.up_next.setText(f"{theming.styled_case('next')}:  {artist} — {title}")
+            self.up_next.setVisible(True)
+        elif self.queue.radio_enabled:
+            self.up_next.setText(theming.styled_case("next:  radio"))
+            self.up_next.setVisible(True)
+        else:
+            self.up_next.setVisible(False)
 
     def _on_radio_state_changed(self, enabled: bool) -> None:
         self.radio_btn.setLabel("radio: on" if enabled else "radio: off")
         self._refresh_nav_buttons()
+        self._refresh_up_next()
 
     def _on_radio_refill_requested(self, seed_video_id: str, exclude: list) -> None:
         thread = QThread(self)
@@ -671,6 +1053,19 @@ class MainWindow(QMainWindow):
         self._last_position = secs
         self.progress.setPosition(secs)
         self._update_time_label(secs, self.player.duration)
+        # Throttle the heavier side-effects: lyrics line lookup + session
+        # dirty marking don't need to run at mpv's ~60Hz position rate.
+        last = getattr(self, "_last_heavy_position", -10.0)
+        if abs(secs - last) >= 0.25:
+            self._last_heavy_position = secs
+            try:
+                self.lyrics_view.update_position(secs)
+            except Exception:
+                pass
+            if not self._restoring_session:
+                self._session_dirty = True
+                if not self._session_save_timer.isActive():
+                    self._session_save_timer.start()
 
     def _on_duration(self, secs: float) -> None:
         self.progress.setDuration(secs)
@@ -680,12 +1075,21 @@ class MainWindow(QMainWindow):
         self.time_label.setText(f"{_mmss(pos)} / {_mmss(dur)}")
 
     def _on_track_ended(self) -> None:
+        from .sleep_timer import SleepMode
+        if self._sleep_mode == SleepMode.AFTER_SONG:
+            self.player.pause()
+            self._sleep_cancel(silent=True)
+            self.statusBar().showMessage("sleep: paused after current song")
+            return
         tr = self.queue.advance()
         if tr:
             self._play_track(tr)
         else:
             self.now_label.setStatus("queue empty")
             self.statusBar().showMessage("queue empty")
+            if self._sleep_mode == SleepMode.AFTER_QUEUE:
+                self._sleep_cancel(silent=True)
+                self.statusBar().showMessage("sleep: paused (queue ended)")
 
     def _on_player_error(self, msg: str) -> None:
         self.statusBar().showMessage(f"player error: {msg}")
@@ -707,12 +1111,19 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+2"), self, lambda: self._switch_view("library"))
         QShortcut(QKeySequence("Ctrl+3"), self, lambda: self._switch_view("queue"))
         QShortcut(QKeySequence("Ctrl+4"), self, lambda: self._switch_view("lyrics"))
+        QShortcut(QKeySequence("Ctrl+5"), self, lambda: self._switch_view("history"))
+        QShortcut(QKeySequence("Ctrl+6"), self, lambda: self._switch_view("explore"))
+        QShortcut(QKeySequence("Ctrl+7"), self, lambda: self._switch_view("visualizer"))
+        QShortcut(QKeySequence("F11"), self, self._toggle_visualizer_fullscreen)
         QShortcut(QKeySequence("Ctrl+,"), self, self.open_settings)
         QShortcut(QKeySequence("Space"), self, self.player.toggle)
         QShortcut(QKeySequence("Ctrl+Right"), self, self._on_next_clicked)
         QShortcut(QKeySequence("Ctrl+Left"), self, self._on_prev_clicked)
         QShortcut(QKeySequence("Ctrl+Up"), self, lambda: self.volume.setVolume(self.volume.volume() + 5))
         QShortcut(QKeySequence("Ctrl+Down"), self, lambda: self.volume.setVolume(self.volume.volume() - 5))
+        QShortcut(QKeySequence("Ctrl+H"), self, self._on_like_clicked)
+        QShortcut(QKeySequence("Ctrl+M"), self, self.toggle_mini_mode)
+        QShortcut(QKeySequence("Ctrl+I"), self, self.open_sleep_timer)
 
     def _on_volume_changed(self, value: int) -> None:
         self.player.set_volume(value)
@@ -736,6 +1147,402 @@ class MainWindow(QMainWindow):
         self.volume.setVolume(value, emit=False)
         self.player.set_volume(value)
 
+    # ---------- sleep timer ----------
+
+    def open_sleep_timer(self) -> None:
+        from .sleep_timer import SleepTimerDialog, SleepMode
+        default_minutes = 30
+        settings = getattr(self, "_settings", None)
+        if settings is not None and getattr(settings, "sleep_preset_minutes", None):
+            default_minutes = int(settings.sleep_preset_minutes)
+        dlg = SleepTimerDialog(default_minutes=default_minutes,
+                               active_mode=self._sleep_mode, parent=self)
+        dlg.started.connect(self._sleep_start)
+        dlg.cancelled.connect(self._sleep_cancel)
+        dlg.exec()
+
+    def _sleep_start(self, mode, minutes: int) -> None:
+        from .sleep_timer import SleepMode
+        import time as _t
+        self._sleep_cancel(silent=True)
+        self._sleep_mode = mode
+        if mode == SleepMode.MINUTES:
+            self._sleep_deadline = _t.time() + minutes * 60
+            self._sleep_timer.start()
+            self.statusBar().showMessage(f"sleep: pausing in {minutes} min")
+            if hasattr(self, "_settings") and self._settings is not None:
+                self._settings.sleep_preset_minutes = minutes
+                try:
+                    from .. import settings as settings_module
+                    settings_module.save(self._settings)
+                except Exception:
+                    pass
+        elif mode == SleepMode.AFTER_SONG:
+            self.statusBar().showMessage("sleep: will pause after current song")
+        elif mode == SleepMode.AFTER_QUEUE:
+            self.statusBar().showMessage("sleep: will pause after current queue")
+
+    def _sleep_cancel(self, silent: bool = False) -> None:
+        was_active = self._sleep_mode is not None
+        self._sleep_mode = None
+        self._sleep_deadline = None
+        self._sleep_timer.stop()
+        if was_active and not silent:
+            self.statusBar().showMessage("sleep timer cancelled")
+
+    def _on_sleep_tick(self) -> None:
+        if self._sleep_deadline is None:
+            return
+        import time as _t
+        remaining = self._sleep_deadline - _t.time()
+        if remaining <= 0:
+            self.statusBar().showMessage("sleep: paused")
+            self.player.pause()
+            self._sleep_cancel(silent=True)
+            return
+        mins, secs = divmod(int(remaining), 60)
+        self.statusBar().showMessage(f"sleep: {mins}:{secs:02d}")
+
+    # ---------- strip layout builders ----------
+
+    def _build_classic_strip_layout(self) -> QHBoxLayout:
+        controls_row = QHBoxLayout()
+        controls_row.setContentsMargins(0, 0, 0, 0)
+        controls_row.setSpacing(2)
+        controls_row.addWidget(self.prev_btn)
+        controls_row.addWidget(self.play_btn)
+        controls_row.addWidget(self.next_btn)
+        controls_row.addWidget(self.like_btn)
+        controls_row.addStretch(1)
+        controls_row.addWidget(self.volume)
+
+        progress_row = QHBoxLayout()
+        progress_row.setContentsMargins(0, 0, 0, 0)
+        progress_row.setSpacing(8)
+        progress_row.addWidget(self.progress, stretch=1)
+        progress_row.addWidget(self.time_label)
+
+        right_col = QVBoxLayout()
+        right_col.setContentsMargins(0, 0, 0, 0)
+        right_col.setSpacing(6)
+        right_col.addWidget(self.up_next)
+        right_col.addWidget(self.now_label, stretch=1)
+        right_col.addLayout(progress_row)
+        right_col.addLayout(controls_row)
+
+        strip_layout = QHBoxLayout()
+        strip_layout.setContentsMargins(16, 12, 16, 12)
+        strip_layout.setSpacing(14)
+        strip_layout.addWidget(self.art)
+        strip_layout.addLayout(right_col, stretch=1)
+        return strip_layout
+
+    def _build_compact_strip_layout(self) -> QVBoxLayout:
+        """Vertical phone-style stack — art centered up top, controls below."""
+        # Wrap art in an h-box to center horizontally.
+        art_row = QHBoxLayout()
+        art_row.addStretch(1)
+        art_row.addWidget(self.art)
+        art_row.addStretch(1)
+
+        progress_row = QHBoxLayout()
+        progress_row.setContentsMargins(0, 0, 0, 0)
+        progress_row.setSpacing(8)
+        progress_row.addWidget(self.progress, stretch=1)
+        progress_row.addWidget(self.time_label)
+
+        controls_row = QHBoxLayout()
+        controls_row.setContentsMargins(0, 0, 0, 0)
+        controls_row.setSpacing(4)
+        controls_row.addStretch(1)
+        controls_row.addWidget(self.prev_btn)
+        controls_row.addWidget(self.play_btn)
+        controls_row.addWidget(self.next_btn)
+        controls_row.addWidget(self.like_btn)
+        controls_row.addStretch(1)
+
+        volume_row = QHBoxLayout()
+        volume_row.setContentsMargins(0, 0, 0, 0)
+        volume_row.addStretch(1)
+        volume_row.addWidget(self.volume)
+        volume_row.addStretch(1)
+
+        strip_layout = QVBoxLayout()
+        strip_layout.setContentsMargins(28, 24, 28, 24)
+        strip_layout.setSpacing(14)
+        strip_layout.addStretch(1)
+        strip_layout.addLayout(art_row)
+        strip_layout.addWidget(self.up_next, alignment=Qt.AlignHCenter)
+        strip_layout.addWidget(self.now_label, alignment=Qt.AlignHCenter)
+        strip_layout.addLayout(progress_row)
+        strip_layout.addLayout(controls_row)
+        strip_layout.addLayout(volume_row)
+        strip_layout.addStretch(1)
+        return strip_layout
+
+    def _rebuild_strip(self, mode: str) -> None:
+        """Replace the strip's layout. Re-parents existing widgets so refs survive.
+
+        Widgets to keep:
+            self.art, self.up_next, self.now_label, self.progress,
+            self.time_label, self.prev_btn, self.play_btn, self.next_btn,
+            self.like_btn, self.volume
+        """
+        keep = [self.art, self.up_next, self.now_label, self.progress,
+                self.time_label, self.prev_btn, self.play_btn, self.next_btn,
+                self.like_btn, self.volume]
+        # Pull our widgets out of the old layout so the layout deletion
+        # doesn't take them with it.
+        for w in keep:
+            if w is None:
+                continue
+            try:
+                w.setParent(None)
+                w.hide()
+            except RuntimeError:
+                pass
+        # The Qt idiom for swapping a layout on a widget: transfer the old
+        # layout to a temp QWidget which then GCs.
+        old_layout = self.strip.layout()
+        if old_layout is not None:
+            temp = QWidget()
+            temp.setLayout(old_layout)
+            temp.deleteLater()
+        # Build + install the new layout.
+        if mode == "compact":
+            new_layout = self._build_compact_strip_layout()
+            self.strip.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        else:
+            new_layout = self._build_classic_strip_layout()
+            self.strip.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.strip.setLayout(new_layout)
+        # Re-parent each widget to the strip and show.
+        for w in keep:
+            if w is None:
+                continue
+            try:
+                w.setParent(self.strip)
+                w.show()
+            except RuntimeError:
+                pass
+
+    # ---------- layout ----------
+
+    def apply_layout(self, layout) -> None:
+        """Apply a new layout: swap slot variants in the now-playing strip,
+        toggle nav/status visibility, resize window per layout's window_default.
+
+        Structural mode changes (classic/compact/stage) are partially handled
+        — compact triggers mini-mode style hiding; stage is currently treated
+        like classic (TODO: side-by-side art + lyrics).
+        """
+        # Slot swap — rebuild whichever widgets changed.
+        new_progress = layout.slots.get("progress", "blocks")
+        new_volume   = layout.slots.get("volume", "blocks")
+        new_art      = layout.slots.get("album_art", "square")
+        new_controls = layout.slots.get("controls", "bracket")
+        new_label    = layout.slots.get("now_label", "stacked")
+
+        if new_progress != self._slot_progress:
+            self._slot_progress = new_progress
+            self._swap_progress(new_progress)
+        if new_volume != self._slot_volume:
+            self._slot_volume = new_volume
+            self._swap_volume(new_volume)
+        if new_art != self._slot_album_art:
+            self._slot_album_art = new_art
+            self._swap_album_art(new_art)
+        if new_controls != self._slot_controls:
+            self._slot_controls = new_controls
+            self._swap_controls(new_controls)
+        if new_label != self._slot_now_label:
+            self._slot_now_label = new_label
+            self._swap_now_label(new_label)
+
+        # Visibility
+        if hasattr(self, "_upper_wrap_widget") and self._upper_wrap_widget is not None:
+            self._upper_wrap_widget.setVisible(layout.visibility.get("nav_rail", True))
+        self.statusBar().setVisible(layout.visibility.get("status_bar", True))
+        # Show/hide nav buttons for views the layout doesn't want.
+        self.nav_queue_btn.setVisible(layout.visibility.get("queue_view", True))
+        self.nav_lyrics_btn.setVisible(layout.visibility.get("lyrics", True))
+        self.nav_history_btn.setVisible(layout.visibility.get("history", True))
+        self.nav_visualizer_btn.setVisible(layout.visibility.get("visualizer", True))
+
+        # Mode-based structural rebuild + window size.
+        new_mode = layout.mode
+        prev_mode = getattr(self, "_layout_mode", "classic")
+        self._layout_mode = new_mode
+        if new_mode != prev_mode:
+            # Toggle mini-mode style hiding and rebuild strip orientation.
+            if new_mode == "compact":
+                if not self._mini_mode:
+                    self.set_mini_mode(True)
+                self._rebuild_strip("compact")
+            else:
+                if self._mini_mode:
+                    self.set_mini_mode(False)
+                self._rebuild_strip("classic")
+        self.resize(*layout.window_default)
+
+        self.statusBar().showMessage(
+            theming.styled_case(f"layout · {layout.name}")
+        )
+
+    def _swap_progress(self, slug: str) -> None:
+        new = make_progress(slug)
+        new.seek_requested.connect(self.player.seek)
+        if self.player.duration > 0:
+            new.setDuration(self.player.duration)
+            new.setPosition(self._last_position)
+        self._replace_in_layout(self.progress, new)
+        self.progress = new
+
+    def _swap_volume(self, slug: str) -> None:
+        new = make_volume(slug)
+        new.volume_changed.connect(self._on_volume_changed)
+        try:
+            new.setVolume(self.volume.volume(), emit=False)
+        except Exception:
+            pass
+        self._replace_in_layout(self.volume, new)
+        self.volume = new
+
+    def _swap_album_art(self, slug: str) -> None:
+        new = make_album_art(slug, 96)
+        def _art_double_click(_ev):
+            self.toggle_mini_mode()
+        new.mouseDoubleClickEvent = _art_double_click   # type: ignore[assignment]
+        self._replace_in_layout(self.art, new)
+        self.art = new
+
+    def _swap_controls(self, slug: str) -> None:
+        new_bundle = make_controls(slug)
+        # Snapshot prev state defensively — buttons may be in any state.
+        def _safe_enabled(btn) -> bool:
+            try:
+                return btn.isEnabled()
+            except (RuntimeError, AttributeError):
+                return False
+        prev_enabled = _safe_enabled(self.prev_btn)
+        play_enabled = _safe_enabled(self.play_btn)
+        next_enabled = _safe_enabled(self.next_btn)
+        like_enabled = _safe_enabled(self.like_btn)
+        new_bundle.prev_btn.setEnabled(prev_enabled)
+        new_bundle.play_btn.setEnabled(play_enabled)
+        new_bundle.next_btn.setEnabled(next_enabled)
+        new_bundle.like_btn.setEnabled(like_enabled)
+        new_bundle.prev_btn.clicked.connect(self._on_prev_clicked)
+        new_bundle.play_btn.clicked.connect(self._on_play_clicked)
+        new_bundle.next_btn.clicked.connect(self._on_next_clicked)
+        new_bundle.like_btn.clicked.connect(self._on_like_clicked)
+        # Swap each button in its layout slot.
+        self._replace_in_layout(self.prev_btn, new_bundle.prev_btn)
+        self._replace_in_layout(self.play_btn, new_bundle.play_btn)
+        self._replace_in_layout(self.next_btn, new_bundle.next_btn)
+        self._replace_in_layout(self.like_btn, new_bundle.like_btn)
+        self.prev_btn = new_bundle.prev_btn
+        self.play_btn = new_bundle.play_btn
+        self.next_btn = new_bundle.next_btn
+        self.like_btn = new_bundle.like_btn
+        self._controls_bundle = new_bundle
+
+    def _swap_now_label(self, slug: str) -> None:
+        new = make_now_label(slug)
+        if self._current is not None:
+            new.setTrack(self._current.artists, self._current.title, self._current.album)
+        self._replace_in_layout(self.now_label, new)
+        self.now_label = new
+
+    def _replace_in_layout(self, old, new) -> None:
+        """Recursively find ``old``'s containing layout (even when nested
+        several levels deep) and swap it for ``new`` at the same index.
+
+        Defensively tolerates already-deleted Qt objects; in that case the
+        new widget is just left orphan (Python ref keeps it alive).
+        """
+        try:
+            parent = old.parentWidget()
+        except RuntimeError:
+            new.deleteLater()
+            return
+        if parent is None:
+            new.deleteLater()
+            return
+        try:
+            top_layout = parent.layout()
+        except RuntimeError:
+            new.deleteLater()
+            return
+        if top_layout is None:
+            new.deleteLater()
+            return
+
+        containing_layout, idx = self._find_widget_in_layout_tree(top_layout, old)
+        if containing_layout is None:
+            new.deleteLater()
+            return
+
+        try:
+            containing_layout.removeWidget(old)
+            old.hide()
+            old.setParent(None)
+            old.deleteLater()
+        except RuntimeError:
+            pass
+        # Reparent new to the same QWidget that owned old's containing layout.
+        owner = containing_layout.parentWidget() or parent
+        new.setParent(owner)
+        try:
+            containing_layout.insertWidget(idx, new)
+        except Exception:
+            containing_layout.addWidget(new)
+        new.show()
+
+    @staticmethod
+    def _find_widget_in_layout_tree(layout, target):
+        """DFS through nested layouts. Returns (containing_layout, index) or (None, -1)."""
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            if item is None:
+                continue
+            try:
+                w = item.widget()
+            except RuntimeError:
+                continue
+            if w is target:
+                return layout, i
+            sub = item.layout()
+            if sub is not None:
+                found_layout, found_idx = MainWindow._find_widget_in_layout_tree(sub, target)
+                if found_layout is not None:
+                    return found_layout, found_idx
+        return None, -1
+
+    # ---------- mini-mode ----------
+
+    def toggle_mini_mode(self) -> None:
+        self.set_mini_mode(not self._mini_mode)
+
+    def set_mini_mode(self, on: bool) -> None:
+        if on == self._mini_mode:
+            return
+        self._mini_mode = on
+        if on:
+            self._geometry_before_mini = self.saveGeometry()
+            if self._upper_wrap_widget is not None:
+                self._upper_wrap_widget.setVisible(False)
+            self.statusBar().setVisible(False)
+            self.resize(340, 360)
+        else:
+            if self._upper_wrap_widget is not None:
+                self._upper_wrap_widget.setVisible(True)
+            self.statusBar().setVisible(True)
+            if self._geometry_before_mini is not None:
+                self.restoreGeometry(self._geometry_before_mini)
+            else:
+                self.resize(1100, 720)
+
     def open_settings(self) -> None:
         from .settings import SettingsDialog
         current = getattr(self, "_settings", None)
@@ -753,10 +1560,124 @@ class MainWindow(QMainWindow):
         discord = getattr(self, "_discord", None)
         if discord is not None:
             discord.configure(new.discord_app_id, new.discord_enabled)
+        # Apply audio device override to the visualizer feed (restart if running).
+        try:
+            self.visualizer_view._set_audio_source(new.audio_device or None)
+        except Exception:
+            pass
+        # Apply listenbrainz settings to the live scrobbler.
+        scrobbler = getattr(self, "_scrobbler", None)
+        if scrobbler is not None:
+            scrobbler.configure(new.listenbrainz_token, new.listenbrainz_enabled)
+        # Apply adaptive accent toggle.
+        adaptive = getattr(self, "_adaptive", None)
+        if adaptive is not None:
+            adaptive.set_enabled(new.adaptive_accent)
+
+    # ---------- session persistence ----------
+
+    def _schedule_session_save(self) -> None:
+        if self._restoring_session:
+            return
+        self._session_dirty = True
+        self._session_save_timer.start()
+
+    def _save_session_now(self) -> None:
+        if self._restoring_session:
+            return
+        try:
+            snap = session_module.snapshot_from(
+                self.queue, self.player.state, self._last_position
+            )
+            session_module.save(snap)
+            self._session_dirty = False
+        except Exception:
+            pass
+
+    def restore_session(self, snapshot: "session_module.Snapshot") -> None:
+        """Re-populate queue + start current track paused at saved position.
+
+        Called from app.py after the window is constructed but before show().
+        """
+        tracks = session_module.tracks_from_snapshot(snapshot)
+        if not tracks or snapshot.current_index < 0 or snapshot.current_index >= len(tracks):
+            return
+
+        self._restoring_session = True
+        try:
+            self.queue.clear()
+            self.queue.add_many(tracks)
+            if snapshot.radio_enabled:
+                seed = tracks[snapshot.current_index].video_id
+                self.queue.enable_radio(seed)
+            current = self.queue.set_current(snapshot.current_index)
+            if current is None:
+                return
+            # Pre-fill the now-playing strip so the user sees state immediately.
+            self._current = current
+            self.now_label.setTrack(current.artists, current.title, current.album)
+            self.now_label.setStatus("paused")
+            self.statusBar().showMessage(f"restored session · paused at {_mmss(snapshot.position_seconds)}")
+            self._fetch_art(current)
+
+            # Resolve + load, then seek + pause. Failures fall back to "just loaded".
+            thread = QThread(self)
+            worker = _ResolveWorker(current.video_id)
+            worker.moveToThread(thread)
+            saved_pos = snapshot.position_seconds
+
+            def _on_resolved(video_id: str, url: str) -> None:
+                if not self._current or self._current.video_id != video_id:
+                    return
+                self.player.load_url(url)
+                self.player.pause()
+                if saved_pos > 1.0:
+                    QTimer.singleShot(300, lambda: self.player.seek(saved_pos))
+                self.play_btn.setEnabled(True)
+                self._refresh_nav_buttons()
+
+            def _on_failed(_vid: str, msg: str) -> None:
+                self.statusBar().showMessage(f"couldn't restore stream: {msg}")
+
+            thread.started.connect(worker.run)
+            worker.resolved.connect(_on_resolved)
+            worker.failed.connect(_on_failed)
+            worker.resolved.connect(thread.quit)
+            worker.failed.connect(thread.quit)
+            thread.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            self._resolve_thread = thread
+            self._resolve_worker = worker
+            thread.start()
+        finally:
+            self._restoring_session = False
 
     # ---------- lifecycle ----------
 
+    def request_quit(self) -> None:
+        """Mark this close as a real quit (vs. a hide-to-tray)."""
+        self._wants_quit = True
+        self.close()
+
     def closeEvent(self, event) -> None:
+        wants_quit = getattr(self, "_wants_quit", False)
+        tray = getattr(self, "_tray", None)
+        # If we have a tray and the user didn't explicitly request quit,
+        # hide-to-tray instead of closing.
+        if tray is not None and not wants_quit:
+            event.ignore()
+            self.hide()
+            return
+        if self._session_dirty:
+            self._save_session_now()
+        else:
+            try:
+                snap = session_module.snapshot_from(
+                    self.queue, self.player.state, self._last_position
+                )
+                session_module.save(snap)
+            except Exception:
+                pass
         self.player.shutdown()
         super().closeEvent(event)
 

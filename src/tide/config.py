@@ -24,6 +24,8 @@ STREAM_CACHE_FILE: Path = CACHE_DIR / "streams.json"
 ART_CACHE_DIR: Path = CACHE_DIR / "art"
 LYRICS_CACHE_DIR: Path = CACHE_DIR / "lyrics"
 USER_THEMES_DIR: Path = CONFIG_DIR / "themes"
+SESSION_FILE: Path = CACHE_DIR / "session.json"
+HISTORY_FILE: Path = CACHE_DIR / "history.jsonl"
 
 
 def ensure_dirs() -> None:

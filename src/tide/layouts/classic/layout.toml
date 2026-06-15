@@ -1,0 +1,21 @@
+[meta]
+name        = "classic"
+slug        = "classic"
+description = "the default — nav rail left, full strip at bottom"
+mode        = "classic"
+window_default = [1100, 720]
+
+[slots]
+progress    = "blocks"
+volume      = "blocks"
+album_art   = "square"
+controls    = "bracket"
+now_label   = "stacked"
+
+[visibility]
+nav_rail    = true
+status_bar  = true
+queue_view  = true
+visualizer  = true
+lyrics      = true
+history     = true

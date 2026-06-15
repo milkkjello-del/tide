@@ -59,16 +59,78 @@ class Queue(QAbstractListModel):
             dur = tr.duration or ""
             marker = "* " if index.row() == self._current else "  "
             return f"{marker}{artist} — {title}    {dur}"
-        if role == Role.Track:
+        if role == Role.Track or role == Qt.UserRole:
             return tr
         if role == Role.IsCurrent:
+            return index.row() == self._current
+        if role == Qt.UserRole + 100:   # TrackRowDelegate.IsCurrentRole
             return index.row() == self._current
         return None
 
     def flags(self, index: QModelIndex):
+        base = Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsDragEnabled
         if not index.isValid():
-            return Qt.NoItemFlags
-        return Qt.ItemIsSelectable | Qt.ItemIsEnabled
+            return Qt.ItemIsDropEnabled
+        return base
+
+    def supportedDropActions(self) -> Qt.DropActions:
+        return Qt.MoveAction
+
+    def supportedDragActions(self) -> Qt.DropActions:
+        return Qt.MoveAction
+
+    def mimeTypes(self) -> list[str]:
+        return ["application/x-tide-queue-row"]
+
+    def mimeData(self, indexes):
+        from PySide6.QtCore import QByteArray, QMimeData
+        rows = sorted({i.row() for i in indexes if i.isValid()})
+        if not rows:
+            return None
+        md = QMimeData()
+        payload = ",".join(str(r) for r in rows).encode("ascii")
+        md.setData("application/x-tide-queue-row", QByteArray(payload))
+        return md
+
+    def dropMimeData(self, data, action, row: int, column: int, parent: QModelIndex) -> bool:
+        if action == Qt.IgnoreAction:
+            return True
+        if not data.hasFormat("application/x-tide-queue-row"):
+            return False
+        raw = bytes(data.data("application/x-tide-queue-row")).decode("ascii")
+        try:
+            src_rows = sorted({int(s) for s in raw.split(",") if s})
+        except ValueError:
+            return False
+        if not src_rows:
+            return False
+        target = row if row >= 0 else self.rowCount()
+        if parent.isValid():
+            target = parent.row()
+        # Single-row move via existing helper.
+        if len(src_rows) == 1:
+            src = src_rows[0]
+            dst = target - 1 if target > src else target
+            dst = max(0, min(self.rowCount() - 1, dst))
+            self.move(src, dst)
+            return True
+        # Multi-row move.
+        moved = [self._tracks[r] for r in src_rows]
+        prev_current_track = self.current
+        self.beginResetModel()
+        for r in reversed(src_rows):
+            del self._tracks[r]
+            if r < target:
+                target -= 1
+        for offset, tr in enumerate(moved):
+            self._tracks.insert(target + offset, tr)
+        if prev_current_track is not None:
+            for i, t in enumerate(self._tracks):
+                if t.video_id == prev_current_track.video_id:
+                    self._current = i
+                    break
+        self.endResetModel()
+        return True
 
     # ---------- introspection ----------
 

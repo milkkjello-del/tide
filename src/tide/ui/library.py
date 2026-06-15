@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import api, theming
+from .track_row import TrackRowDelegate
 from .widgets import BracketButton
 
 
@@ -60,8 +61,9 @@ class _PlaylistDetailWorker(QObject):
 
 
 def _line_heading(label: str, total: int = 60) -> str:
-    line = "─" * max(4, total - len(label) - 6)
-    return f"── {label.lower()} {line}"
+    styled = theming.styled_case(label)
+    line = "─" * max(4, total - len(styled) - 6)
+    return f"── {styled} {line}"
 
 
 class LibraryView(QWidget):
@@ -141,6 +143,9 @@ class LibraryView(QWidget):
         self.tracks_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tracks_list.customContextMenuRequested.connect(self._on_track_menu)
         self.tracks_list.itemActivated.connect(self._on_track_activated)
+        self._track_delegate = TrackRowDelegate(self)
+        self._track_delegate.attach(self.tracks_list)
+        self.tracks_list.setItemDelegate(self._track_delegate)
 
         det_col = QVBoxLayout()
         det_col.setContentsMargins(16, 14, 16, 8)
@@ -183,9 +188,9 @@ class LibraryView(QWidget):
         self.index_heading.setText(_line_heading(f"your library · {len(items)}"))
         self.playlists_list.clear()
         for p in items:
-            label = f"{marker}{(p.title or '').lower()}"
+            label = f"{marker}{theming.styled_case(p.title or '')}"
             if p.description:
-                label += f"    {p.description.lower()}"
+                label += f"    {theming.styled_case(p.description)}"
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, p)
             self.playlists_list.addItem(item)
@@ -206,7 +211,7 @@ class LibraryView(QWidget):
         self.tracks_list.clear()
         self.detail_heading.setText(_line_heading(f"{entry.title} · loading…"))
         self.stack.setCurrentIndex(1)
-        self.status_message.emit(f"loading {entry.title.lower()}…")
+        self.status_message.emit(theming.styled_case(f"loading {entry.title}…"))
 
         thread = QThread(self)
         worker = _PlaylistDetailWorker(self.api, entry.playlist_id)
@@ -228,8 +233,8 @@ class LibraryView(QWidget):
         self.detail_heading.setText(_line_heading(f"{detail.title} · {len(detail.tracks)}"))
         self.tracks_list.clear()
         for tr in detail.tracks:
-            artist = (tr.artists or "").lower()
-            title = (tr.title or "").lower()
+            artist = theming.styled_case(tr.artists or "")
+            title = theming.styled_case(tr.title or "")
             dur = tr.duration or ""
             label = f"{marker}{artist} — {title}"
             if dur:
@@ -238,7 +243,7 @@ class LibraryView(QWidget):
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, tr)
             self.tracks_list.addItem(item)
-        self.status_message.emit(f"{detail.title.lower()} · {len(detail.tracks)} tracks")
+        self.status_message.emit(theming.styled_case(f"{detail.title} · {len(detail.tracks)} tracks"))
 
     def _on_detail_failed(self, msg: str) -> None:
         self.detail_heading.setText(_line_heading("playlist load failed"))

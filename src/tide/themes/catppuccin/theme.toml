@@ -32,3 +32,4 @@ spacing_px      = 12
 ambient_art     = false
 control_style   = "glyph"
 list_marker     = "  "
+visualizer      = "bars-filled"

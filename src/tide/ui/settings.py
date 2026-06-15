@@ -19,8 +19,10 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
+    QWidget,
 )
 
 from .. import auth, settings as settings_module, theming
@@ -36,13 +38,26 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("tide — settings")
         self.setModal(True)
-        self.setMinimumWidth(540)
+        self.setMinimumWidth(620)
+        self.resize(680, 720)
 
         self._initial_theme = current_settings.theme
+        self._initial_thumbnails = current_settings.show_thumbnails or "theme"
+        # Copy known fields; defaults handle anything we don't mirror.
         self._settings = settings_module.Settings(
             theme=current_settings.theme,
             discord_enabled=current_settings.discord_enabled,
             discord_app_id=current_settings.discord_app_id,
+            volume=current_settings.volume,
+            sleep_preset_minutes=current_settings.sleep_preset_minutes,
+            mini_mode_default=current_settings.mini_mode_default,
+            show_thumbnails=current_settings.show_thumbnails or "theme",
+            audio_device=current_settings.audio_device or "",
+            listenbrainz_enabled=current_settings.listenbrainz_enabled,
+            listenbrainz_token=current_settings.listenbrainz_token,
+            layout=current_settings.layout or "classic",
+            layout_overrides=dict(current_settings.layout_overrides or {}),
+            adaptive_accent=current_settings.adaptive_accent,
         )
 
         self._build_ui()
@@ -58,8 +73,55 @@ class SettingsDialog(QDialog):
         self.theme_picker = QComboBox()
         self.theme_picker.currentIndexChanged.connect(self._on_theme_changed)
 
+        self.thumbnails_picker = QComboBox()
+        self.thumbnails_picker.addItem("from theme", "theme")
+        self.thumbnails_picker.addItem("always show", "on")
+        self.thumbnails_picker.addItem("never show", "off")
+        self.thumbnails_picker.currentIndexChanged.connect(self._on_thumbnails_changed)
+
+        # Audio device picker for the visualizer (backup; cog menu has it too).
+        self.audio_device_picker = QComboBox()
+        self.audio_device_picker.addItem("auto (default sink monitor)", "")
+        try:
+            from .. import audio_capture
+            for name, label in audio_capture.list_monitor_sources():
+                self.audio_device_picker.addItem(label, name)
+        except Exception:
+            pass
+
+        # Layout preset picker.
+        self.layout_picker = QComboBox()
+        from .. import layout as layout_module
+        for lay in layout_module.manager().list_layouts():
+            self.layout_picker.addItem(lay.name, lay.slug)
+        self.layout_picker.currentIndexChanged.connect(self._on_layout_changed)
+
+        # Per-slot override pickers.
+        from . import variants as variants_module
+        self._slot_pickers: dict[str, QComboBox] = {}
+        for slot, options in variants_module.all_variant_slugs().items():
+            cb = QComboBox()
+            cb.addItem("(from layout)", "")
+            for opt in options:
+                cb.addItem(opt, opt)
+            cb.currentIndexChanged.connect(lambda _i=0, s=slot: self._on_slot_override(s))
+            self._slot_pickers[slot] = cb
+
+        # Adaptive accent.
+        self.adaptive_toggle = QCheckBox("shift accent to album art")
+        self.adaptive_toggle.toggled.connect(self._on_adaptive_toggled)
+
         appearance_form = QFormLayout()
         appearance_form.addRow("theme:", self.theme_picker)
+        appearance_form.addRow("layout:", self.layout_picker)
+        appearance_form.addRow("  progress:", self._slot_pickers["progress"])
+        appearance_form.addRow("  volume:", self._slot_pickers["volume"])
+        appearance_form.addRow("  album art:", self._slot_pickers["album_art"])
+        appearance_form.addRow("  controls:", self._slot_pickers["controls"])
+        appearance_form.addRow("  label:", self._slot_pickers["now_label"])
+        appearance_form.addRow("thumbnails:", self.thumbnails_picker)
+        appearance_form.addRow("adaptive:", self.adaptive_toggle)
+        appearance_form.addRow("visualizer audio:", self.audio_device_picker)
 
         # ---- discord ----
         discord_heading = QLabel("── discord rich presence ──")
@@ -96,6 +158,41 @@ class SettingsDialog(QDialog):
         discord_col.addLayout(discord_id_row)
         discord_col.addWidget(discord_explainer)
 
+        # ---- listenbrainz ----
+        lb_heading = QLabel("── listenbrainz scrobbling ──")
+        lb_heading.setProperty("class", "dim")
+
+        self.lb_toggle = QCheckBox("enable listenbrainz scrobbling")
+        self.lb_token = QLineEdit()
+        self.lb_token.setPlaceholderText("paste your listenbrainz user token")
+        self.lb_token.setEchoMode(QLineEdit.Password)
+        self.lb_token.setEnabled(False)
+        self.lb_toggle.toggled.connect(self.lb_token.setEnabled)
+
+        self.lb_help = QPushButton("get a token  →")
+        self.lb_help.setFlat(True)
+        self.lb_help.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl("https://listenbrainz.org/profile/"))
+        )
+
+        lb_token_row = QHBoxLayout()
+        lb_token_row.addWidget(self.lb_token, stretch=1)
+        lb_token_row.addWidget(self.lb_help)
+
+        lb_explainer = QLabel(
+            "submits 'playing now' on track start and a 'listen' once you've heard "
+            "the track for 30s (or 50% / 4 minutes). create an account at "
+            "listenbrainz.org → settings → token."
+        )
+        lb_explainer.setWordWrap(True)
+        lb_explainer.setProperty("class", "dim")
+
+        lb_col = QVBoxLayout()
+        lb_col.setSpacing(6)
+        lb_col.addWidget(self.lb_toggle)
+        lb_col.addLayout(lb_token_row)
+        lb_col.addWidget(lb_explainer)
+
         # ---- advanced ----
         advanced_heading = QLabel("── advanced ──────────────────")
         advanced_heading.setProperty("class", "dim")
@@ -106,6 +203,51 @@ class SettingsDialog(QDialog):
         adv_col = QVBoxLayout()
         adv_col.setSpacing(6)
         adv_col.addWidget(self.sign_out_btn, alignment=Qt.AlignLeft)
+
+        # ---- about ----
+        about_heading = QLabel("── about ─────────────────────")
+        about_heading.setProperty("class", "dim")
+
+        from .. import __version__
+        title = QLabel(f"tide  v{__version__}")
+        title.setStyleSheet("font-weight: 600;")
+
+        tagline = QLabel("a brutalist youtube music client.")
+        tagline.setProperty("class", "dim")
+
+        credits = QLabel(
+            "built on:  pyside6 · mpv · ytmusicapi · yt-dlp · cryptography\n"
+            "fonts:     ibm plex mono · ibm plex sans  (ofl)\n"
+            "licensed:  gpl-3.0-or-later"
+        )
+        credits.setProperty("class", "dim")
+        credits.setStyleSheet("font-family: monospace;")
+        credits.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        self.repo_btn = QPushButton("github  →")
+        self.repo_btn.setFlat(True)
+        self.repo_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl("https://github.com/milkkjello-del/tide"))
+        )
+
+        self.issues_btn = QPushButton("report a bug  →")
+        self.issues_btn.setFlat(True)
+        self.issues_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl("https://github.com/milkkjello-del/tide/issues"))
+        )
+
+        about_links = QHBoxLayout()
+        about_links.addWidget(self.repo_btn)
+        about_links.addWidget(self.issues_btn)
+        about_links.addStretch(1)
+
+        about_col = QVBoxLayout()
+        about_col.setSpacing(4)
+        about_col.addWidget(title)
+        about_col.addWidget(tagline)
+        about_col.addSpacing(6)
+        about_col.addWidget(credits)
+        about_col.addLayout(about_links)
 
         # ---- buttons ----
         self.save_btn = QPushButton("save")
@@ -120,19 +262,37 @@ class SettingsDialog(QDialog):
         btn_row.addWidget(self.cancel_btn)
         btn_row.addWidget(self.save_btn)
 
-        # ---- assemble ----
+        # ---- assemble (scrollable so growing the dialog never breaks) ----
+        content = QWidget()
+        content_col = QVBoxLayout(content)
+        content_col.setContentsMargins(0, 0, 0, 0)
+        content_col.setSpacing(12)
+        content_col.addWidget(appearance_heading)
+        content_col.addLayout(appearance_form)
+        content_col.addSpacing(6)
+        content_col.addWidget(discord_heading)
+        content_col.addLayout(discord_col)
+        content_col.addSpacing(6)
+        content_col.addWidget(lb_heading)
+        content_col.addLayout(lb_col)
+        content_col.addSpacing(6)
+        content_col.addWidget(advanced_heading)
+        content_col.addLayout(adv_col)
+        content_col.addSpacing(6)
+        content_col.addWidget(about_heading)
+        content_col.addLayout(about_col)
+        content_col.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidget(content)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 18, 22, 14)
-        root.setSpacing(12)
-        root.addWidget(appearance_heading)
-        root.addLayout(appearance_form)
-        root.addSpacing(6)
-        root.addWidget(discord_heading)
-        root.addLayout(discord_col)
-        root.addSpacing(6)
-        root.addWidget(advanced_heading)
-        root.addLayout(adv_col)
-        root.addStretch(1)
+        root.setSpacing(10)
+        root.addWidget(scroll, stretch=1)
         root.addLayout(btn_row)
 
     def _populate(self) -> None:
@@ -144,9 +304,33 @@ class SettingsDialog(QDialog):
         if idx >= 0:
             self.theme_picker.setCurrentIndex(idx)
 
+        thumb_idx = self.thumbnails_picker.findData(self._settings.show_thumbnails or "theme")
+        if thumb_idx >= 0:
+            self.thumbnails_picker.setCurrentIndex(thumb_idx)
+
+        dev_idx = self.audio_device_picker.findData(self._settings.audio_device or "")
+        if dev_idx >= 0:
+            self.audio_device_picker.setCurrentIndex(dev_idx)
+
+        # Layout + overrides.
+        lay_idx = self.layout_picker.findData(self._settings.layout or "classic")
+        if lay_idx >= 0:
+            self.layout_picker.setCurrentIndex(lay_idx)
+        overrides = self._settings.layout_overrides or {}
+        for slot, cb in self._slot_pickers.items():
+            val = overrides.get(slot, "")
+            idx = cb.findData(val)
+            if idx >= 0:
+                cb.setCurrentIndex(idx)
+        self.adaptive_toggle.setChecked(self._settings.adaptive_accent)
+
         self.discord_toggle.setChecked(self._settings.discord_enabled)
         self.discord_app_id.setText(self._settings.discord_app_id)
         self.discord_app_id.setEnabled(self._settings.discord_enabled)
+
+        self.lb_toggle.setChecked(self._settings.listenbrainz_enabled)
+        self.lb_token.setText(self._settings.listenbrainz_token)
+        self.lb_token.setEnabled(self._settings.listenbrainz_enabled)
 
     # ---------- handlers ----------
 
@@ -155,6 +339,47 @@ class SettingsDialog(QDialog):
         if slug:
             theming.manager().apply(slug)
 
+    def _on_layout_changed(self, _idx: int) -> None:
+        slug = self.layout_picker.currentData()
+        if not slug:
+            return
+        from .. import layout as layout_module
+        # Live-apply preview through the parent MainWindow.
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "apply_layout"):
+            effective = layout_module.manager().apply(slug, dict(self._gather_overrides()))
+            if effective is not None:
+                parent.apply_layout(effective)
+
+    def _on_slot_override(self, slot: str) -> None:
+        overrides = dict(self._gather_overrides())
+        from .. import layout as layout_module
+        effective = layout_module.manager().update_overrides(overrides)
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "apply_layout"):
+            parent.apply_layout(effective)
+
+    def _gather_overrides(self) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for slot, cb in self._slot_pickers.items():
+            val = cb.currentData() or ""
+            if val:
+                out[slot] = val
+        return out
+
+    def _on_adaptive_toggled(self, on: bool) -> None:
+        # P5.3 wires the driver — here we just persist.
+        pass
+
+    def _on_thumbnails_changed(self, _idx: int) -> None:
+        from .track_row import set_thumbnail_override
+        value = self.thumbnails_picker.currentData() or "theme"
+        set_thumbnail_override(value)
+        # Force the live theme to re-emit so attached delegates repaint.
+        current = theming.manager().current()
+        if current is not None:
+            theming.manager().theme_changed.emit(current)
+
     def _on_discord_toggle(self, on: bool) -> None:
         self.discord_app_id.setEnabled(on)
 
@@ -162,13 +387,26 @@ class SettingsDialog(QDialog):
         self._settings.theme = self.theme_picker.currentData() or self._initial_theme
         self._settings.discord_enabled = self.discord_toggle.isChecked()
         self._settings.discord_app_id = self.discord_app_id.text().strip()
+        self._settings.show_thumbnails = self.thumbnails_picker.currentData() or "theme"
+        self._settings.audio_device = self.audio_device_picker.currentData() or ""
+        self._settings.listenbrainz_enabled = self.lb_toggle.isChecked()
+        self._settings.listenbrainz_token = self.lb_token.text().strip()
+        self._settings.layout = self.layout_picker.currentData() or "classic"
+        self._settings.layout_overrides = self._gather_overrides()
+        self._settings.adaptive_accent = self.adaptive_toggle.isChecked()
         settings_module.save(self._settings)
         self.accept()
 
     def _on_cancel(self) -> None:
-        # Revert live theme preview if the user changed it.
+        # Revert live previews.
         if self._initial_theme and self._initial_theme != self.theme_picker.currentData():
             theming.manager().apply(self._initial_theme)
+        if self._initial_thumbnails != (self.thumbnails_picker.currentData() or "theme"):
+            from .track_row import set_thumbnail_override
+            set_thumbnail_override(self._initial_thumbnails)
+            current = theming.manager().current()
+            if current is not None:
+                theming.manager().theme_changed.emit(current)
         self.reject()
 
     def _on_sign_out(self) -> None:

@@ -32,3 +32,4 @@ spacing_px      = 10
 ambient_art     = false
 control_style   = "icon"
 list_marker     = "  "
+visualizer      = "oscilloscope"

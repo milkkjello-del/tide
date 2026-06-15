@@ -215,27 +215,45 @@ class DiscordPresence(QObject):
         if not self._connected or self._client is None or self._last_activity is None:
             return
         a = self._last_activity
-        details = (a.title or "tide").strip()
+
+        # When paused, hide the presence entirely — most users don't want
+        # "paused tide" sitting on their profile while they walked away.
+        if a.paused:
+            self._clear()
+            return
+
+        # Honor the active theme's typography.case so brutalist users get
+        # lowercase presence, synthwave gets l33t, etc.
+        from . import theming
+        details = theming.styled_case((a.title or "tide").strip())
         state_parts: list[str] = []
         if a.artists:
-            state_parts.append(a.artists)
+            state_parts.append(theming.styled_case(a.artists))
         if a.album:
-            state_parts.append(a.album)
+            state_parts.append(theming.styled_case(a.album))
         state_text = " · ".join(state_parts) or "—"
 
+        # Use start + end (unix-second timestamps) so Discord renders the
+        # "0:34 / 3:42" progress bar based on actual song position.
+        now_s = int(time.time())
+        played_secs = int(max(0.0, time.time() - a.started_at))
+        duration_secs = max(0, a.duration_seconds)
+        if duration_secs > 0:
+            played_secs = min(played_secs, duration_secs)
+        start_s = now_s - played_secs
+        end_s = start_s + duration_secs if duration_secs > 0 else 0
         kwargs: dict = {
             "activity_type": ActivityType.LISTENING,
             "details": details[:128],
             "state": state_text[:128],
             "large_text": "tide",
+            "start": start_s,
+            "small_text": "playing",
         }
+        if end_s > 0:
+            kwargs["end"] = end_s
         if a.art_url:
             kwargs["large_image"] = a.art_url
-        if not a.paused:
-            kwargs["start"] = int(a.started_at)
-            kwargs["small_text"] = "playing"
-        else:
-            kwargs["small_text"] = "paused"
 
         try:
             self._client.update(**kwargs)

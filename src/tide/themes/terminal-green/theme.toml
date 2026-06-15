@@ -22,7 +22,7 @@ border_dim  = "#004d26"
 family  = "IBM Plex Mono"
 size_pt = 10
 weight  = 400
-case    = "lower"
+case    = "upper"
 mono    = true
 
 [layout]
@@ -30,5 +30,7 @@ radius_px       = 0
 border_px       = 1
 spacing_px      = 8
 ambient_art     = false
+show_thumbnails = false
 control_style   = "bracket"
 list_marker     = "> "
+visualizer      = "bars-mono"

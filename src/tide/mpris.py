@@ -343,6 +343,10 @@ class MprisService(QObject):
             self._emit_props_changed({"Metadata": self.metadata})
 
     def _on_current_changed(self, track) -> None:
+        # Reset duration FIRST so the first Metadata emit doesn't carry the
+        # previous track's mpris:length (KDE Plasma's mediacontroller caches
+        # by trackid and won't override a length once stored).
+        self._duration_us = 0
         self._current_track = track
         self._position_us = 0
         # Many things move at once when the track flips.
@@ -355,6 +359,10 @@ class MprisService(QObject):
             "CanGoPrevious": self.can_go_previous,
         }
         self._emit_props_changed(changes)
+        # Also signal that the position got reset, since position_us silently
+        # went to 0 and clients shouldn't think we just scrubbed backward
+        # within the SAME track.
+        self._emit_seeked(0)
 
     def _on_queue_changed(self, *_args) -> None:
         self._emit_props_changed({

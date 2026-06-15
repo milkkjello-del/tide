@@ -140,6 +140,7 @@ class ThemeManager(QObject):
         super().__init__(parent)
         self._themes: dict[str, Theme] = {}
         self._current: Theme | None = None
+        self._token_overrides: dict[str, str] = {}
 
     def refresh(self) -> None:
         self._themes = discover_themes()
@@ -160,8 +161,9 @@ class ThemeManager(QObject):
             return None
         _register_fonts(theme)
 
-        # Compose the stylesheet with substituted tokens.
-        qss = _substitute(theme.qss, theme)
+        # Compose the stylesheet with substituted tokens (overrides win).
+        effective_theme = self._with_overrides(theme)
+        qss = _substitute(theme.qss, effective_theme)
 
         app = QApplication.instance()
         if app is not None:
@@ -176,8 +178,68 @@ class ThemeManager(QObject):
             app.setStyleSheet(qss)
 
         self._current = theme
-        self.theme_changed.emit(theme)
-        return theme
+        self.theme_changed.emit(effective_theme)
+        return effective_theme
+
+    def _with_overrides(self, theme: Theme) -> Theme:
+        """Return a Theme whose tokens have the runtime overrides applied."""
+        if not self._token_overrides:
+            return theme
+        merged = dict(theme.tokens)
+        merged.update(self._token_overrides)
+        return Theme(
+            slug=theme.slug, name=theme.name, path=theme.path,
+            tokens=merged, typography=theme.typography, layout=theme.layout,
+            qss=theme.qss, dark=theme.dark,
+        )
+
+    def override_tokens(self, overrides: dict[str, str]) -> None:
+        """Patch one or more token values at runtime (used by the adaptive
+        driver). Pushes new QSS to the QApplication every call (cheap), but
+        throttles the cascading ``theme_changed`` signal that drives custom-
+        painted widgets to repaint — they only need the latest value, and
+        emitting 60×/sec triggers a stampede of viewport updates across all
+        list views.
+        """
+        if not overrides:
+            return
+        self._token_overrides.update(overrides)
+        if self._current is None:
+            return
+        effective = self._with_overrides(self._current)
+        qss = _substitute(self._current.qss, effective)
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(qss)
+        # Throttle: emit at most ~10Hz during a burst of overrides.
+        import time as _t
+        now = _t.monotonic()
+        last = getattr(self, "_last_override_emit", 0.0)
+        if now - last >= 0.10:
+            self._last_override_emit = now
+            self.theme_changed.emit(effective)
+        else:
+            # Schedule a trailing emit so the final state is delivered.
+            from PySide6.QtCore import QTimer as _QT
+            if not getattr(self, "_pending_override_emit", False):
+                self._pending_override_emit = True
+                def _flush():
+                    self._pending_override_emit = False
+                    if self._current is not None:
+                        self._last_override_emit = _t.monotonic()
+                        self.theme_changed.emit(self._with_overrides(self._current))
+                _QT.singleShot(110, _flush)
+
+    def clear_accent_override(self) -> None:
+        """Remove the accent override (and bg_alt) so the base theme returns."""
+        had = bool(self._token_overrides)
+        self._token_overrides.clear()
+        if had and self._current is not None:
+            qss = _substitute(self._current.qss, self._current)
+            app = QApplication.instance()
+            if app is not None:
+                app.setStyleSheet(qss)
+            self.theme_changed.emit(self._current)
 
 
 # Process-global theme manager. UI code uses `manager()` to subscribe to
@@ -190,3 +252,62 @@ def manager() -> ThemeManager:
     if _manager is None:
         _manager = ThemeManager()
     return _manager
+
+
+# ---------- text-case transforms ----------
+
+_LEET_MAP = str.maketrans({
+    "a": "4", "A": "4",
+    "e": "3", "E": "3",
+    "i": "1", "I": "1",
+    "o": "0", "O": "0",
+    "s": "5", "S": "5",
+    "t": "7", "T": "7",
+    "l": "1", "L": "1",
+    "z": "2", "Z": "2",
+})
+
+_ZALGO_MARKS = (
+    "̀", "́", "̂", "̃", "̄", "̆", "̇",
+    "̈", "̊", "̋", "̌", "̐", "̒", "̓",
+    "̔", "̚", "̼", "͏", "͛",
+)
+
+
+def _to_zalgo(s: str, intensity: int = 2) -> str:
+    import random
+    rng = random.Random(hash(s) & 0xFFFFFFFF)
+    out: list[str] = []
+    for ch in s:
+        out.append(ch)
+        if ch.isalpha():
+            for _ in range(rng.randint(0, intensity)):
+                out.append(rng.choice(_ZALGO_MARKS))
+    return "".join(out)
+
+
+def styled_case(text: str, theme: "Theme | None" = None) -> str:
+    """Apply the active theme's typography.case to ``text``.
+
+    Modes:
+      - "lower"  → all lowercase
+      - "upper"  → ALL UPPERCASE
+      - "normal" → keep input casing
+      - "leet"   → L1K3 TH1Z!1
+      - "zalgo"  → text with combining diacritics
+    """
+    if not text:
+        return text
+    t = theme if theme is not None else manager().current()
+    case = "lower"
+    if t is not None:
+        case = str(t.t("typography", "case", "lower"))
+    if case == "upper":
+        return text.upper()
+    if case == "normal":
+        return text
+    if case == "leet":
+        return text.translate(_LEET_MAP)
+    if case == "zalgo":
+        return _to_zalgo(text)
+    return text.lower()

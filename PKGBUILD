@@ -1,6 +1,6 @@
 # Maintainer: tide maintainer <you@example.com>
 pkgname=tide
-pkgver=1.0.0
+pkgver=1.1.0
 pkgrel=1
 pkgdesc="A brutalist YouTube Music desktop client"
 arch=('any')
@@ -14,6 +14,8 @@ depends=(
   'yt-dlp'
   'python-ytmusicapi'
   'python-cryptography'
+  'python-numpy'
+  'python-sounddevice'
   'ttf-ibm-plex'
 )
 optdepends=(

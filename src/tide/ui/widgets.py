@@ -394,7 +394,7 @@ class NowPlayingLabel(QWidget):
 
         if not self._title and not self._status:
             p.setPen(dim)
-            p.drawText(rect, Qt.AlignVCenter | Qt.AlignLeft, "nothing playing")
+            p.drawText(rect, Qt.AlignVCenter | Qt.AlignLeft, theming.styled_case("nothing playing", self._theme))
             return
 
         line1_rect = QRect(rect.x(), rect.y(), rect.width(), fm.height())
@@ -406,15 +406,15 @@ class NowPlayingLabel(QWidget):
             f"{self._artist} — {self._title}" if (self._artist and self._title)
             else (self._title or self._artist)
         )
-        line1 = fm.elidedText(line1.lower(), Qt.ElideRight, line1_rect.width())
+        line1 = fm.elidedText(theming.styled_case(line1, self._theme), Qt.ElideRight, line1_rect.width())
         p.drawText(line1_rect, Qt.AlignVCenter | Qt.AlignLeft, line1)
 
         # line 2: album · status (dim)
         line2_parts: list[str] = []
         if self._album:
-            line2_parts.append(self._album.lower())
+            line2_parts.append(theming.styled_case(self._album, self._theme))
         if self._status:
-            line2_parts.append(self._status.lower())
+            line2_parts.append(theming.styled_case(self._status, self._theme))
         line2 = "  ·  ".join(line2_parts)
         if line2:
             p.setPen(dim)

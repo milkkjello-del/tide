@@ -1,0 +1,21 @@
+[meta]
+name        = "walkman"
+slug        = "walkman"
+description = "portrait, circle art, knob volume, no nav"
+mode        = "compact"
+window_default = [480, 720]
+
+[slots]
+progress    = "thin"
+volume      = "knob"
+album_art   = "circle"
+controls    = "large"
+now_label   = "centered"
+
+[visibility]
+nav_rail    = false
+status_bar  = false
+queue_view  = false
+visualizer  = true
+lyrics      = true
+history     = true

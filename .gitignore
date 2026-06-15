@@ -13,6 +13,8 @@ dist/
 # AUR build artifacts (makepkg pkg/ and extracted source dirs, not src/tide/)
 /pkg/
 /tide-*/
+src/tide-*/
+src/*.tar.gz
 *.pkg.tar.zst
 *.pkg.tar.xz
-tide-1.0.0.tar.gz
+*.tar.gz

@@ -17,6 +17,8 @@ depends=(
   'yt-dlp'
   'python-ytmusicapi'
   'python-cryptography'
+  'python-numpy'
+  'python-sounddevice'
   'ttf-ibm-plex'
 )
 optdepends=(

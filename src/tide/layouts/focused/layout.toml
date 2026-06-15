@@ -1,0 +1,21 @@
+[meta]
+name        = "focused"
+slug        = "focused"
+description = "i'm listening, not browsing — big art, soft controls"
+mode        = "stage"
+window_default = [1000, 720]
+
+[slots]
+progress    = "thin"
+volume      = "slider"
+album_art   = "square"
+controls    = "large"
+now_label   = "centered"
+
+[visibility]
+nav_rail    = true
+status_bar  = false
+queue_view  = true
+visualizer  = true
+lyrics      = true
+history     = true

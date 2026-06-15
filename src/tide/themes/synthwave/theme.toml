@@ -23,7 +23,7 @@ border_dim  = "#3a2670"
 family  = "IBM Plex Sans"
 size_pt = 11
 weight  = 500
-case    = "normal"
+case    = "leet"
 mono    = false
 
 [layout]
@@ -33,3 +33,4 @@ spacing_px      = 10
 ambient_art     = false
 control_style   = "glyph"
 list_marker     = "  "
+visualizer      = "neon-grid"

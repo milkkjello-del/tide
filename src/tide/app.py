@@ -10,7 +10,7 @@ locale.setlocale(locale.LC_NUMERIC, "C")
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from . import auth, config, settings as settings_module, theming
+from . import auth, cache, config, session as session_module, settings as settings_module, theming
 from .api import Api
 from .discord_rpc import DiscordPresence
 from .mpris import MprisService
@@ -49,6 +49,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 def run(argv: list[str] | None = None) -> int:
     config.ensure_dirs()
+    # Trim art cache on startup so the directory doesn't grow forever.
+    try:
+        cache.prune_art_cache()
+    except Exception:
+        pass
     args = _parse_args(sys.argv[1:] if argv is None else argv)
 
     if args.list_themes:
@@ -64,9 +69,22 @@ def run(argv: list[str] | None = None) -> int:
 
     user_settings = settings_module.load()
 
+    # Apply thumbnail override before any view paints.
+    from .ui.track_row import set_thumbnail_override
+    set_thumbnail_override(user_settings.show_thumbnails or "theme")
+
     # Apply the theme as early as possible so the wizard renders with it.
     theming.manager().refresh()
     theming.manager().apply(args.theme or user_settings.theme or DEFAULT_THEME)
+
+    # Layout — pick + overrides. Applied before window construction so the
+    # initial UI uses the right variants.
+    from . import layout as layout_module
+    layout_module.manager().refresh()
+    layout_module.manager().apply(
+        user_settings.layout or "classic",
+        user_settings.layout_overrides or {},
+    )
 
     yt = ensure_signed_in()
     if yt is None:
@@ -75,6 +93,12 @@ def run(argv: list[str] | None = None) -> int:
     api_obj = Api(yt)
     player = Player()
     window = MainWindow(api_obj, player)
+
+    # Restore last session (queue + paused at last position) before showing.
+    saved_session = session_module.load()
+    if saved_session is not None and saved_session.tracks:
+        window.restore_session(saved_session)
+
     window.show()
 
     # System integration: MPRIS2 (media keys + KDE/GNOME panel controls).
@@ -82,16 +106,69 @@ def run(argv: list[str] | None = None) -> int:
     if not mpris.start():
         print("tide: MPRIS2 registration failed (no session bus?)", file=sys.stderr)
 
+    # System tray (KDE/GNOME panel). Falls back silently if no tray host.
+    from PySide6.QtWidgets import QSystemTrayIcon
+    if QSystemTrayIcon.isSystemTrayAvailable():
+        from .ui.tray import TideTray
+        window._tray = TideTray(window, player, window.queue, parent=window)
+    else:
+        window._tray = None
+
     # Discord rich presence — opt-in, configured via settings dialog.
     discord = DiscordPresence(player, window.queue)
     discord.start_wire()
     discord.configure(user_settings.discord_app_id, user_settings.discord_enabled)
+
+    # ListenBrainz scrobbling — opt-in via Settings → ListenBrainz.
+    from .listenbrainz import ListenBrainzScrobbler
+    scrobbler = ListenBrainzScrobbler(player, window.queue)
+    scrobbler.configure(user_settings.listenbrainz_token, user_settings.listenbrainz_enabled)
+    window._scrobbler = scrobbler
+
+    # Adaptive accent driver — shifts theme accent toward album art.
+    from .ui.adaptive import AdaptiveDriver
+    adaptive = AdaptiveDriver(window.queue)
+    adaptive.set_enabled(user_settings.adaptive_accent)
+    window._adaptive = adaptive
+
+    # Once-a-day update check.
+    from PySide6.QtCore import QMetaObject, Qt, Q_ARG
+    from PySide6.QtGui import QDesktopServices
+    from PySide6.QtCore import QUrl as _QUrl
+    from . import __version__, updates
+    from .ui.toast import show_toast
+
+    def _on_newer(tag: str, url: str) -> None:
+        # Cross-thread → marshal to GUI thread via QTimer.singleShot(0, ...).
+        from PySide6.QtCore import QTimer as _QT
+        def deliver():
+            show_toast(
+                window,
+                f"new tide release: {tag}",
+                action_label="view",
+                on_action=lambda: QDesktopServices.openUrl(_QUrl(url)),
+            )
+        _QT.singleShot(0, deliver)
+    try:
+        updates.check_in_background(__version__, _on_newer)
+    except Exception:
+        pass
     # Expose so the (later) settings dialog can re-configure live.
     window._discord = discord
     window._settings = user_settings
     window.apply_initial_volume(user_settings.volume)
 
     rc = app.exec()
+    # Best-effort teardown so threads + native handles close cleanly.
+    try:
+        window.visualizer_view.teardown()
+    except Exception:
+        pass
+    try:
+        if window._tray is not None:
+            window._tray.teardown()
+    except Exception:
+        pass
     discord.shutdown()
     mpris.stop()
     return rc

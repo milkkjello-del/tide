@@ -1,0 +1,21 @@
+[meta]
+name        = "dj-deck"
+slug        = "dj-deck"
+description = "queue front-and-center, dense controls, fast scrub"
+mode        = "classic"
+window_default = [1280, 760]
+
+[slots]
+progress    = "bar"
+volume      = "wedge"
+album_art   = "square"
+controls    = "compact"
+now_label   = "inline"
+
+[visibility]
+nav_rail    = true
+status_bar  = true
+queue_view  = true
+visualizer  = true
+lyrics      = false
+history     = true
