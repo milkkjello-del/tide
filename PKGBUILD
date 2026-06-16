@@ -1,8 +1,8 @@
 # Maintainer: tide maintainer <you@example.com>
 pkgname=tide
-pkgver=1.1.0
+pkgver=1.2.0
 pkgrel=1
-pkgdesc="A brutalist YouTube Music desktop client"
+pkgdesc="A brutalist multi-source music desktop client"
 arch=('any')
 url="https://github.com/milkkjello-del/tide"
 license=('GPL-3.0-or-later')
@@ -16,12 +16,14 @@ depends=(
   'python-cryptography'
   'python-numpy'
   'python-sounddevice'
+  'python-mutagen'
   'ttf-ibm-plex'
 )
 optdepends=(
   'python-pypresence: Discord rich presence integration'
   'python-secretstorage: GNOME/libsecret backend for cookie import'
   'kwallet: KDE wallet backend for cookie import'
+  'python-watchdog: live re-indexing of the local files source'
 )
 makedepends=(
   'python-build'
@@ -29,7 +31,7 @@ makedepends=(
   'python-hatchling'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('eda71c193c8949bfebf6b00b9a2fd4583d86bd3fc2ac58be54ec6b5d3ee0d199')
+sha256sums=('SKIP')   # refresh after v1.2.0 tarball is published
 
 build() {
   cd "$pkgname-$pkgver"

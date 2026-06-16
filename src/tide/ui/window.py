@@ -37,6 +37,8 @@ from PySide6.QtWidgets import (
 
 from .. import api, history as history_module, layout as layout_module, session as session_module, theming
 from ..player import PlayState, Player
+from ..playback import PlaybackRouter
+from ..sources import StreamRef, registry as source_registry
 from ..queue import Queue, Role
 from .album import AlbumView
 from .artist import ArtistView
@@ -84,18 +86,78 @@ class _SearchWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class _FederatedSearchWorker(QObject):
+    """Fan-out search across all enabled sources, merge as each returns.
+
+    Songs-only — albums/artists/videos vary too much per source to merge
+    meaningfully in v1.2.0 (and several sources don't expose them at all).
+    """
+
+    partial = Signal(str, list)         # source slug, tracks
+    done = Signal(str, list)             # filter, all_tracks
+    failed = Signal(str)
+
+    def __init__(self, query: str) -> None:
+        super().__init__()
+        self.query = query
+        self._collected: list = []
+        self._remaining: int = 0
+        self._lock_remaining = False
+
+    def run(self) -> None:
+        from PySide6.QtCore import QRunnable, QThreadPool
+        from ..sources import registry as _registry
+        sources = _registry().enabled_sources()
+        if not sources:
+            self.done.emit("songs", [])
+            return
+        self._remaining = len(sources)
+
+        outer = self
+
+        class _One(QRunnable):
+            def __init__(self_inner, source):
+                super().__init__()
+                self_inner.source = source
+
+            def run(self_inner):
+                try:
+                    tracks = self_inner.source.search_songs(outer.query, limit=15)
+                except Exception:
+                    tracks = []
+                outer.partial.emit(self_inner.source.slug, tracks)
+
+        # Connect partial → accumulator BEFORE dispatch so we don't miss
+        # fast returns.
+        self.partial.connect(self._on_partial)
+        pool = QThreadPool.globalInstance()
+        for s in sources:
+            pool.start(_One(s))
+
+    def _on_partial(self, slug: str, tracks: list) -> None:
+        self._collected.extend(tracks)
+        self._remaining -= 1
+        if self._remaining <= 0:
+            self.done.emit("songs", list(self._collected))
+
+
 class _ResolveWorker(QObject):
-    resolved = Signal(str, str)
+    # video_id, StreamRef (or its mpv-payload URL for back-compat consumers)
+    resolved = Signal(str, object)
     failed = Signal(str, str)
 
-    def __init__(self, video_id: str) -> None:
+    def __init__(self, track: api.Track) -> None:
         super().__init__()
-        self.video_id = video_id
+        self.track = track
+        self.video_id = track.video_id
 
     def run(self) -> None:
         try:
-            url = api.resolve_stream_url(self.video_id)
-            self.resolved.emit(self.video_id, url)
+            source = source_registry().get(self.track.source or "ytmusic")
+            if source is None:
+                raise RuntimeError(f"no source registered for {self.track.source!r}")
+            ref = source.resolve_stream(self.track)
+            self.resolved.emit(self.video_id, ref)
         except Exception as exc:
             self.failed.emit(self.video_id, str(exc))
 
@@ -139,7 +201,7 @@ class _RateWorker(QObject):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, api_obj: api.Api, player: Player) -> None:
+    def __init__(self, api_obj: api.Api, player: PlaybackRouter | Player) -> None:
         super().__init__()
         self.setWindowTitle("tide")
         self.resize(1100, 720)
@@ -202,6 +264,7 @@ class MainWindow(QMainWindow):
         self.nav_lyrics_btn = BracketButton("lyrics")
         self.nav_history_btn = BracketButton("history")
         self.nav_visualizer_btn = BracketButton("visualizer")
+        self.nav_source_btn = BracketButton("source")
         self.nav_settings_btn = BracketButton("settings")
         self.nav_search_btn.clicked.connect(lambda: self._switch_view("search"))
         self.nav_explore_btn.clicked.connect(lambda: self._switch_view("explore"))
@@ -210,6 +273,7 @@ class MainWindow(QMainWindow):
         self.nav_lyrics_btn.clicked.connect(lambda: self._switch_view("lyrics"))
         self.nav_history_btn.clicked.connect(lambda: self._switch_view("history"))
         self.nav_visualizer_btn.clicked.connect(lambda: self._switch_view("visualizer"))
+        self.nav_source_btn.clicked.connect(lambda: self._switch_view("source"))
         self.nav_settings_btn.clicked.connect(self.open_settings)
 
         nav_col = QVBoxLayout()
@@ -222,6 +286,7 @@ class MainWindow(QMainWindow):
         nav_col.addWidget(self.nav_lyrics_btn)
         nav_col.addWidget(self.nav_history_btn)
         nav_col.addWidget(self.nav_visualizer_btn)
+        nav_col.addWidget(self.nav_source_btn)
         nav_col.addStretch(1)
         nav_col.addWidget(self.nav_settings_btn)
         nav = QFrame()
@@ -387,6 +452,19 @@ class MainWindow(QMainWindow):
         self.visualizer_view = VisualizerView()
         self.visualizer_view.status_message.connect(self._set_status)
 
+        # ----- source panel -----
+        from .source_panel import SourcePanel
+        # _settings is attached by app.py after the window is built. To avoid
+        # a chicken-and-egg, fall back to a fresh Settings instance — but the
+        # panel is always re-created against the real one when it's set.
+        from ..settings import Settings as _Settings
+        initial_settings = getattr(self, "_settings", None) or _Settings()
+        self.source_view = SourcePanel(initial_settings)
+        self.source_view.active_changed.connect(self._on_active_source_changed)
+        self.source_view.enabled_changed.connect(self._on_source_enabled_changed)
+        self.source_view.settings_changed.connect(self._persist_settings)
+        self.source_view.local_dir_changed.connect(self._on_local_dir_changed)
+
         # ----- stack -----
         self.stack = QStackedWidget()
         self.stack.addWidget(search_view)            # 0
@@ -398,6 +476,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.album_view)        # 6
         self.stack.addWidget(self.artist_view)       # 7
         self.stack.addWidget(self.visualizer_view)   # 8
+        self.stack.addWidget(self.source_view)       # 9
 
         # Simple back stack of previous indices so AlbumView/ArtistView can pop.
         self._view_history: list[int] = []
@@ -484,6 +563,69 @@ class MainWindow(QMainWindow):
     def _set_status(self, msg: str) -> None:
         self.statusBar().showMessage(msg)
 
+    # ---------- multi-source (v1.2) ----------
+
+    def _on_active_source_changed(self, slug: str) -> None:
+        """Retarget Search / Library / Explore at the new active source."""
+        reg = source_registry()
+        new_source = reg.get(slug)
+        if new_source is None:
+            return
+        self.api = new_source
+        # Cascade to views that hold their own api ref.
+        for view in (self.library_view, self.lyrics_view, self.explore_view,
+                     self.album_view, self.artist_view):
+            try:
+                view.api = new_source
+            except Exception:
+                pass
+        # Clear search results — they're source-specific.
+        try:
+            self.results.clear()
+            self.results_cards.clear()
+        except Exception:
+            pass
+        self.statusBar().showMessage(f"active source: {new_source.name}")
+
+    def _on_source_enabled_changed(self, slug: str, enabled: bool) -> None:
+        if slug == "local" and enabled:
+            reg = source_registry()
+            local = reg.get("local")
+            if local is not None:
+                self._rescan_local_in_background(local)
+
+    def _on_local_dir_changed(self, new_dir: str) -> None:
+        reg = source_registry()
+        local = reg.get("local")
+        if local is None:
+            return
+        self._rescan_local_in_background(local)
+
+    def _rescan_local_in_background(self, local) -> None:
+        from PySide6.QtCore import QRunnable, QThreadPool
+        panel = self.source_view
+
+        class _Job(QRunnable):
+            def run(self_inner):
+                try:
+                    local.rescan()
+                    local.start_watcher()
+                except Exception:
+                    pass
+
+        QThreadPool.globalInstance().start(_Job())
+        QTimer.singleShot(800, panel.refresh_statuses)
+        QTimer.singleShot(3000, panel.refresh_statuses)
+
+    def _persist_settings(self) -> None:
+        if not hasattr(self, "_settings") or self._settings is None:
+            return
+        try:
+            from .. import settings as _settings_module
+            _settings_module.save(self._settings)
+        except Exception:
+            pass
+
     # ---------- nav ----------
 
     def _switch_view(self, name: str) -> None:
@@ -510,6 +652,9 @@ class MainWindow(QMainWindow):
             self.explore_view.ensure_loaded()
         elif name == "visualizer":
             self.stack.setCurrentIndex(8)
+        elif name == "source":
+            self.stack.setCurrentIndex(9)
+            self.source_view.refresh_statuses()
         # Reset back-stack on root-level navigation so [back] doesn't
         # bounce between top-level views.
         if prev in (6, 7) and self.stack.currentIndex() not in (6, 7):
@@ -536,8 +681,25 @@ class MainWindow(QMainWindow):
         self.heading.setText(self._line_heading(f"searching “{q}”"))
         self.results.clear()
         self.results_cards.clear()
-        self.statusBar().showMessage(f"searching {self._search_filter}: {q}")
 
+        # Federated mode: songs filter only, fan out to every enabled source.
+        federated = (
+            getattr(self, "_settings", None) is not None
+            and bool(self._settings.federated_search)
+            and self._search_filter == "songs"
+        )
+
+        if federated:
+            self.statusBar().showMessage(f"federated search: {q}")
+            worker = _FederatedSearchWorker(q)
+            # Federated worker uses QThreadPool internally — no QThread needed.
+            worker.done.connect(self._on_results)
+            worker.failed.connect(self._on_search_failed)
+            self._search_worker = worker
+            worker.run()
+            return
+
+        self.statusBar().showMessage(f"searching {self._search_filter}: {q}")
         thread = QThread(self)
         worker = _SearchWorker(self.api, q, self._search_filter)
         worker.moveToThread(thread)
@@ -577,11 +739,22 @@ class MainWindow(QMainWindow):
 
         if not is_cards:
             marker = self._list_marker()
+            federated = (
+                getattr(self, "_settings", None) is not None
+                and bool(self._settings.federated_search)
+                and filter_ == "songs"
+            )
+            reg = source_registry()
             for tr in items:
                 artist = theming.styled_case(tr.artists or "")
                 title = theming.styled_case(tr.title or "")
                 dur = tr.duration or ""
-                label = f"{marker}{artist} — {title}"
+                tag = ""
+                if federated:
+                    src = reg.get(getattr(tr, "source", "") or "")
+                    if src is not None and src.short_tag:
+                        tag = f"[{src.short_tag}] "
+                label = f"{marker}{tag}{artist} — {title}"
                 if dur:
                     gap = max(2, 60 - len(label) - len(dur))
                     label = f"{label}{' ' * gap}{dur}"
@@ -821,7 +994,7 @@ class MainWindow(QMainWindow):
                 pass
 
         thread = QThread(self)
-        worker = _ResolveWorker(track.video_id)
+        worker = _ResolveWorker(track)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.resolved.connect(self._on_resolved)
@@ -834,10 +1007,14 @@ class MainWindow(QMainWindow):
         self._resolve_worker = worker
         thread.start()
 
-    def _on_resolved(self, video_id: str, url: str) -> None:
+    def _on_resolved(self, video_id: str, ref: object) -> None:
         if not self._current or self._current.video_id != video_id:
             return
-        self.player.load_url(url)
+        if isinstance(ref, StreamRef):
+            self.player.load_ref(ref)
+        else:
+            # Defensive: handle a bare URL if some path still emits one.
+            self.player.load_url(str(ref))
         self.now_label.setStatus("")
         self.statusBar().showMessage("playing")
         self.play_btn.setEnabled(True)
@@ -1114,6 +1291,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+5"), self, lambda: self._switch_view("history"))
         QShortcut(QKeySequence("Ctrl+6"), self, lambda: self._switch_view("explore"))
         QShortcut(QKeySequence("Ctrl+7"), self, lambda: self._switch_view("visualizer"))
+        QShortcut(QKeySequence("Ctrl+8"), self, lambda: self._switch_view("source"))
         QShortcut(QKeySequence("F11"), self, self._toggle_visualizer_fullscreen)
         QShortcut(QKeySequence("Ctrl+,"), self, self.open_settings)
         QShortcut(QKeySequence("Space"), self, self.player.toggle)
@@ -1622,14 +1800,17 @@ class MainWindow(QMainWindow):
 
             # Resolve + load, then seek + pause. Failures fall back to "just loaded".
             thread = QThread(self)
-            worker = _ResolveWorker(current.video_id)
+            worker = _ResolveWorker(current)
             worker.moveToThread(thread)
             saved_pos = snapshot.position_seconds
 
-            def _on_resolved(video_id: str, url: str) -> None:
+            def _on_resolved(video_id: str, ref: object) -> None:
                 if not self._current or self._current.video_id != video_id:
                     return
-                self.player.load_url(url)
+                if isinstance(ref, StreamRef):
+                    self.player.load_ref(ref)
+                else:
+                    self.player.load_url(str(ref))
                 self.player.pause()
                 if saved_pos > 1.0:
                     QTimer.singleShot(300, lambda: self.player.seek(saved_pos))

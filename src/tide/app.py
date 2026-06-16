@@ -14,7 +14,14 @@ from . import auth, cache, config, session as session_module, settings as settin
 from .api import Api
 from .discord_rpc import DiscordPresence
 from .mpris import MprisService
+from .playback import MpvBackend, PlaybackRouter
 from .player import Player
+from .sources import registry as source_registry
+from .sources.bandcamp import BandcampSource
+from .sources.local import LocalSource
+from .sources.mixcloud import MixcloudSource
+from .sources.soundcloud import SoundCloudSource
+from .sources.ytmusic import YTMusicSource
 from .ui.window import MainWindow
 from .ui.wizard import SignInDialog
 
@@ -90,8 +97,42 @@ def run(argv: list[str] | None = None) -> int:
     if yt is None:
         return 1
 
-    api_obj = Api(yt)
-    player = Player()
+    # ---------- source registry (v1.2 multi-source) ----------
+    reg = source_registry()
+    yt_source = YTMusicSource(yt)
+    reg.register(yt_source, enabled=user_settings.sources_enabled.get("ytmusic", True))
+    reg.register(SoundCloudSource(),
+                 enabled=user_settings.sources_enabled.get("soundcloud", True))
+    reg.register(BandcampSource(),
+                 enabled=user_settings.sources_enabled.get("bandcamp", True))
+    reg.register(MixcloudSource(),
+                 enabled=user_settings.sources_enabled.get("mixcloud", False))
+    local_dir = user_settings.local_music_dir or None
+    local_source = LocalSource(music_dir=local_dir)
+    reg.register(local_source,
+                 enabled=user_settings.sources_enabled.get("local", True))
+    reg.set_active(user_settings.active_source or "ytmusic")
+
+    if user_settings.local_auto_index and reg.is_enabled("local"):
+        # Index the music dir in the background so the UI stays responsive.
+        from PySide6.QtCore import QThreadPool, QRunnable
+        class _IndexJob(QRunnable):
+            def run(self_inner):
+                try:
+                    local_source.rescan()
+                    local_source.start_watcher()
+                except Exception:
+                    pass
+        QThreadPool.globalInstance().start(_IndexJob())
+
+    # The active source is what the rest of the UI binds to as "self.api".
+    api_obj = reg.active or yt_source
+
+    # ---------- playback router ----------
+    router = PlaybackRouter()
+    router.register(MpvBackend())
+    # v1.2.1+ will append LibrespotBackend / MusicKitBackend here.
+    player = router
     window = MainWindow(api_obj, player)
 
     # Restore last session (queue + paused at last position) before showing.
@@ -156,6 +197,12 @@ def run(argv: list[str] | None = None) -> int:
     # Expose so the (later) settings dialog can re-configure live.
     window._discord = discord
     window._settings = user_settings
+    # The SourcePanel was constructed with a placeholder Settings; rebind to
+    # the real one so toggles persist.
+    try:
+        window.source_view.bind_settings(user_settings)
+    except Exception:
+        pass
     window.apply_initial_volume(user_settings.volume)
 
     rc = app.exec()

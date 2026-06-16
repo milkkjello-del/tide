@@ -1,0 +1,108 @@
+"""Source registry — singleton holding all instantiated `MusicSource`s.
+
+The registry tracks per-source enable state, the active source (drives
+Search / Library / Explore by default), and provides the iteration target
+for federated search.
+"""
+from __future__ import annotations
+
+from PySide6.QtCore import QObject, Signal
+
+from .base import (
+    AlbumDetail,
+    AlbumEntry,
+    ArtistDetail,
+    ArtistEntry,
+    MusicSource,
+    NotSupportedError,
+    PlaylistDetail,
+    PlaylistEntry,
+    Shelf,
+    ShelfItem,
+    StreamRef,
+    Track,
+)
+
+
+class SourceRegistry(QObject):
+    """Holds sources, fires when active or enabled state changes."""
+
+    active_changed = Signal(str)            # new active slug
+    enabled_changed = Signal(str, bool)     # slug, enabled
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._sources: dict[str, MusicSource] = {}
+        self._enabled: dict[str, bool] = {}
+        self._active: str = "ytmusic"
+
+    def register(self, source: MusicSource, *, enabled: bool = True) -> None:
+        slug = source.slug
+        if not slug:
+            raise ValueError("MusicSource must have a slug")
+        self._sources[slug] = source
+        self._enabled.setdefault(slug, enabled)
+
+    def all(self) -> list[MusicSource]:
+        return list(self._sources.values())
+
+    def get(self, slug: str) -> MusicSource | None:
+        return self._sources.get(slug)
+
+    def enabled_sources(self) -> list[MusicSource]:
+        return [s for slug, s in self._sources.items() if self._enabled.get(slug)]
+
+    def is_enabled(self, slug: str) -> bool:
+        return bool(self._enabled.get(slug))
+
+    def set_enabled(self, slug: str, enabled: bool) -> None:
+        if slug not in self._sources:
+            return
+        if self._enabled.get(slug) == enabled:
+            return
+        self._enabled[slug] = enabled
+        self.enabled_changed.emit(slug, enabled)
+
+    @property
+    def active(self) -> MusicSource | None:
+        return self._sources.get(self._active)
+
+    @property
+    def active_slug(self) -> str:
+        return self._active
+
+    def set_active(self, slug: str) -> None:
+        if slug not in self._sources or slug == self._active:
+            return
+        self._active = slug
+        self._enabled.setdefault(slug, True)
+        self._enabled[slug] = True
+        self.active_changed.emit(slug)
+
+
+_registry: SourceRegistry | None = None
+
+
+def registry() -> SourceRegistry:
+    global _registry
+    if _registry is None:
+        _registry = SourceRegistry()
+    return _registry
+
+
+__all__ = [
+    "AlbumDetail",
+    "AlbumEntry",
+    "ArtistDetail",
+    "ArtistEntry",
+    "MusicSource",
+    "NotSupportedError",
+    "PlaylistDetail",
+    "PlaylistEntry",
+    "Shelf",
+    "ShelfItem",
+    "SourceRegistry",
+    "StreamRef",
+    "Track",
+    "registry",
+]

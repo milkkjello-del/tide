@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tide"
-version = "1.1.0"
-description = "a brutalist youtube music client"
+version = "1.2.0.dev0"
+description = "a brutalist multi-source music client"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "GPL-3.0-or-later" }
@@ -26,11 +26,13 @@ dependencies = [
     "yt-dlp>=2024.1.1",
     "python-mpv>=1.0",
     "cryptography>=41",
+    "mutagen>=1.46",
 ]
 
 [project.optional-dependencies]
 discord = ["pypresence>=4.6"]
 secretservice = ["SecretStorage>=3"]
+local_watch = ["watchdog>=4"]
 
 [project.scripts]
 tide = "tide.__main__:main"

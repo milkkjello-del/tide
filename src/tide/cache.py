@@ -1,13 +1,15 @@
 """Cache for stream URLs and album art.
 
-Stream URLs are TTL'd because YouTube's CDN URLs expire ~6h after fetch.
-Album art is mtime-pruned because thumbs are small and we just don't want
-the directory growing unbounded.
+Stream URLs are TTL'd because most CDN URLs expire (~6h for YouTube; longer
+for some, effectively infinite for Bandcamp). v1.2 splits the cache so each
+source gets its own file with its own retention policy. Album art is
+mtime-pruned in one shared directory.
 
-The stream cache is a single JSON file:
-    ~/.cache/tide/streams.json   {video_id: {url, expires_at}}
+Storage layout::
 
-It's capped on save: oldest by expires_at first, then by total entry count.
+    ~/.cache/tide/streams/<source_slug>.json   {video_id: {url, expires_at}}
+
+Each source picks its own TTL when calling ``put_stream_url(source, ...)``.
 """
 from __future__ import annotations
 
@@ -18,22 +20,56 @@ from pathlib import Path
 from . import config
 
 
-STREAM_TTL_SECONDS = 4 * 3600          # YT URLs typically last ~6h
-STREAM_MAX_ENTRIES = 500
-STREAM_MAX_BYTES = 5 * 1024 * 1024     # 5 MB
+STREAM_TTL_SECONDS = 4 * 3600          # default; sources override
+STREAM_MAX_ENTRIES = 500               # per source
+STREAM_MAX_BYTES = 5 * 1024 * 1024     # per source
 ART_MAX_FILES = 1000
 
-
-# In-memory mirror, populated lazily from disk.
-_stream_mem: dict[str, tuple[str, float]] | None = None
-
-
-# ---------- stream cache ----------
+# infinity stand-in for sources whose URLs never expire (e.g. Bandcamp)
+NEVER_EXPIRES = float("inf")
 
 
-def _load_stream_disk() -> dict[str, tuple[str, float]]:
-    path = config.STREAM_CACHE_FILE
+# In-memory mirror keyed by source slug → {video_id: (url, expires_at)}
+_mem: dict[str, dict[str, tuple[str, float]]] = {}
+
+
+# ---------- per-source paths ----------
+
+def _streams_dir() -> Path:
+    p = config.CACHE_DIR / "streams"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _stream_file(source: str) -> Path:
+    safe = "".join(c for c in source if c.isalnum() or c in "._-") or "default"
+    return _streams_dir() / f"{safe}.json"
+
+
+def _legacy_stream_file() -> Path:
+    return config.STREAM_CACHE_FILE
+
+
+# ---------- disk i/o ----------
+
+def _load_disk(source: str) -> dict[str, tuple[str, float]]:
+    path = _stream_file(source)
     if not path.is_file():
+        # One-time migration: if the pre-v1.2 streams.json exists and this
+        # is the ytmusic cache, adopt it.
+        if source == "ytmusic" and _legacy_stream_file().is_file():
+            try:
+                with open(_legacy_stream_file(), encoding="utf-8") as f:
+                    raw = json.load(f)
+                out = {k: (v["url"], float(v["expires_at"])) for k, v in raw.items()}
+                _save_disk(source, out)
+                try:
+                    _legacy_stream_file().unlink()
+                except OSError:
+                    pass
+                return out
+            except Exception:
+                return {}
         return {}
     try:
         with open(path, encoding="utf-8") as f:
@@ -43,9 +79,8 @@ def _load_stream_disk() -> dict[str, tuple[str, float]]:
         return {}
 
 
-def _save_stream_disk(cache: dict[str, tuple[str, float]]) -> None:
-    path = config.STREAM_CACHE_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _save_disk(source: str, cache: dict[str, tuple[str, float]]) -> None:
+    path = _stream_file(source)
     serializable = {k: {"url": u, "expires_at": exp} for k, (u, exp) in cache.items()}
     tmp = path.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -53,34 +88,31 @@ def _save_stream_disk(cache: dict[str, tuple[str, float]]) -> None:
     tmp.replace(path)
 
 
-def _prune_stream_cache(cache: dict[str, tuple[str, float]]) -> None:
-    """Drop expired entries first, then trim to size cap by oldest expires_at."""
+def _prune(cache: dict[str, tuple[str, float]]) -> None:
     now = time.time()
     expired = [k for k, (_, exp) in cache.items() if exp <= now]
     for k in expired:
         cache.pop(k, None)
-
     if len(cache) <= STREAM_MAX_ENTRIES:
         return
-
-    # Sort by expires_at ascending; the smallest are closest to expiry.
     by_age = sorted(cache.items(), key=lambda kv: kv[1][1])
     keep = dict(by_age[-STREAM_MAX_ENTRIES:])
     cache.clear()
     cache.update(keep)
 
 
-def _ensure_stream_loaded() -> dict[str, tuple[str, float]]:
-    global _stream_mem
-    if _stream_mem is None:
-        _stream_mem = _load_stream_disk()
-        _prune_stream_cache(_stream_mem)
-    return _stream_mem
+def _ensure_loaded(source: str) -> dict[str, tuple[str, float]]:
+    if source not in _mem:
+        _mem[source] = _load_disk(source)
+        _prune(_mem[source])
+    return _mem[source]
 
 
-def get_stream_url(video_id: str) -> str | None:
-    """Return a cached URL if still valid, else None."""
-    mem = _ensure_stream_loaded()
+# ---------- public api ----------
+
+def get_stream_url(source: str, video_id: str) -> str | None:
+    """Return a cached URL for ``video_id`` under ``source`` if still valid."""
+    mem = _ensure_loaded(source)
     cached = mem.get(video_id)
     if not cached:
         return None
@@ -90,42 +122,43 @@ def get_stream_url(video_id: str) -> str | None:
     return url
 
 
-def put_stream_url(video_id: str, url: str, ttl_seconds: float = STREAM_TTL_SECONDS) -> None:
-    mem = _ensure_stream_loaded()
-    mem[video_id] = (url, time.time() + ttl_seconds)
-    _prune_stream_cache(mem)
+def put_stream_url(source: str, video_id: str, url: str,
+                   ttl_seconds: float = STREAM_TTL_SECONDS) -> None:
+    """Persist a URL with the given TTL (use ``cache.NEVER_EXPIRES`` for
+    immortal sources)."""
+    mem = _ensure_loaded(source)
+    expires = time.time() + ttl_seconds if ttl_seconds != NEVER_EXPIRES else NEVER_EXPIRES
+    mem[video_id] = (url, expires)
+    _prune(mem)
     try:
-        _save_stream_disk(mem)
+        _save_disk(source, mem)
     except Exception:
         pass
-    _enforce_byte_cap()
+    _enforce_byte_cap(source)
 
 
-def _enforce_byte_cap() -> None:
-    path = config.STREAM_CACHE_FILE
+def _enforce_byte_cap(source: str) -> None:
+    path = _stream_file(source)
     try:
         size = path.stat().st_size
     except OSError:
         return
     if size <= STREAM_MAX_BYTES:
         return
-    # Halve the cache by oldest expires_at and re-save.
-    mem = _ensure_stream_loaded()
+    mem = _ensure_loaded(source)
     by_age = sorted(mem.items(), key=lambda kv: kv[1][1])
     keep = dict(by_age[len(by_age) // 2:])
     mem.clear()
     mem.update(keep)
     try:
-        _save_stream_disk(mem)
+        _save_disk(source, mem)
     except Exception:
         pass
 
 
 # ---------- art cache prune ----------
 
-
 def prune_art_cache() -> int:
-    """Keep newest ART_MAX_FILES files in the art cache dir. Returns count removed."""
     art_dir: Path = config.ART_CACHE_DIR
     if not art_dir.is_dir():
         return 0

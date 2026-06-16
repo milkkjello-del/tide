@@ -30,6 +30,19 @@ class Settings:
     layout: str = "classic"
     layout_overrides: dict = field(default_factory=dict)
     adaptive_accent: bool = False
+    # v1.2 multi-source
+    active_source: str = "ytmusic"
+    federated_search: bool = False
+    # Per-source on/off. Keys are source slugs; values are bools.
+    sources_enabled: dict = field(default_factory=lambda: {
+        "ytmusic": True,
+        "soundcloud": True,
+        "bandcamp": True,
+        "mixcloud": False,
+        "local": True,
+    })
+    local_music_dir: str = ""
+    local_auto_index: bool = True
 
 
 def _to_toml(s: Settings) -> str:
