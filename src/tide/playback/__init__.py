@@ -37,6 +37,10 @@ class PlaybackRouter(QObject):
         # the persisted values from Settings after construction.
         self._speed: float = 1.0
         self._pitch_correction: bool = False
+        # Audio FX chain — the mpv `af` filter graph string. Empty means
+        # the rack is off / bypassed. Cached so a backend registered
+        # mid-session picks up the user's current chain.
+        self._audio_filter_chain: str = ""
 
     def register(self, backend: PlaybackBackend) -> None:
         slug = backend.slug
@@ -61,6 +65,10 @@ class PlaybackRouter(QObject):
             pass
         try:
             backend.set_pitch_correction(self._pitch_correction)
+        except Exception:
+            pass
+        try:
+            backend.set_audio_filter_chain(self._audio_filter_chain)
         except Exception:
             pass
         # First registered backend becomes the implicit default (mpv).
@@ -150,6 +158,18 @@ class PlaybackRouter(QObject):
         for b in self._backends.values():
             try:
                 b.set_pitch_correction(self._pitch_correction)
+            except Exception:
+                pass
+
+    @Slot(str)
+    def set_audio_filter_chain(self, chain: str) -> None:
+        """Cache + fan out the audio FX filter chain to every backend.
+        Backends that don't own audio rendering (librespot, MusicKit)
+        no-op via the base-class default."""
+        self._audio_filter_chain = chain or ""
+        for b in self._backends.values():
+            try:
+                b.set_audio_filter_chain(self._audio_filter_chain)
             except Exception:
                 pass
 

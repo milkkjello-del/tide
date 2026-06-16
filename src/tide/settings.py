@@ -54,6 +54,9 @@ class Settings:
     # Font-family override. Empty = use the active theme's typography.family.
     # When set, the theming manager pushes this family on every theme apply.
     font_family_override: str = ""
+    # Set to True the first time the OnboardingDialog reaches its final step
+    # and the user clicks launch. False = wizard runs at next launch.
+    first_launch_complete: bool = False
     # v1.2 multi-source
     active_source: str = "ytmusic"
     federated_search: bool = False
@@ -64,9 +67,43 @@ class Settings:
         "bandcamp": True,
         "mixcloud": False,
         "local": True,
+        "subsonic": False,
+        "spotify": False,
     })
     local_music_dir: str = ""
     local_auto_index: bool = True
+    # v1.2.1 — Spotify (Librespot backend)
+    # Empty client_id falls through to the tide-shipped default. Power users
+    # can paste their own dev-app client_id here (e.g. for higher rate
+    # limits or to avoid tide's shared app). PKCE means no secret needed.
+    spotify_client_id: str = ""
+    # Audio quality: 96 / 160 / 320 kbps (320 requires Premium tier).
+    spotify_bitrate: int = 320
+    # Pulse/Pipe sink name passed to librespot. Empty = default sink.
+    spotify_audio_device: str = ""
+    # Show tide as a Spotify Connect device on the user's account. Off =
+    # librespot launched with --disable-discovery so it's local-only.
+    spotify_connect_enabled: bool = True
+    # v1.2.1 — Subsonic / Navidrome (home music server)
+    # Empty url means no server is configured; SubsonicSource registers
+    # only when all three fields are populated.
+    subsonic_url: str = ""
+    subsonic_user: str = ""
+    subsonic_pass: str = ""
+    # API auth style: "salt" uses MD5(password + salt) per the Subsonic
+    # spec (the safe-over-HTTP default); "plain" sends the password
+    # directly via `p=` (HTTPS-only Navidrome installs).
+    subsonic_auth_style: str = "salt"
+    # v1.2.2 — Audio FX rack (10-band EQ + reverb + loudness norm + more).
+    # ``audio_fx_state`` is the AudioFxState dataclass round-tripped as
+    # JSON. Stored as a string field because the existing TOML serializer
+    # only handles one level of nesting and the FX state has list-of-dict
+    # slots inside it.
+    audio_fx_state: str = ""
+    # v1.2.3 — UI sounds (nav clicks, modal pops, toggle chirps). Auto-
+    # muted while music is playing. Default off so a fresh install is
+    # silent until the user opts in via Settings → appearance.
+    ui_sounds_enabled: bool = False
 
 
 def _to_toml(s: Settings) -> str:
@@ -99,6 +136,7 @@ def _to_toml(s: Settings) -> str:
 def load() -> Settings:
     path = config.SETTINGS_FILE
     if not path.is_file():
+        # First-ever launch — wizard will run.
         return Settings()
     try:
         with open(path, "rb") as f:
@@ -107,6 +145,11 @@ def load() -> Settings:
         return Settings()
     known = {f.name for f in fields(Settings)}
     filtered = {k: v for k, v in raw.items() if k in known}
+    # If the settings file exists at all, the user is past first launch —
+    # the file only gets written by `save()` which only runs after the
+    # wizard, in-app settings dialog, etc. Auto-stamp existing configs so
+    # users upgrading from pre-wizard versions don't get re-onboarded.
+    filtered.setdefault("first_launch_complete", True)
     return Settings(**filtered)
 
 

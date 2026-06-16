@@ -51,6 +51,12 @@ class PlaybackBackend(QObject):
     def set_pitch_correction(self, enabled: bool) -> None:
         return None
 
+    # Audio FX filter chain — backends that own their own audio path
+    # (librespot streams pre-rendered to its sink, MusicKit ditto) just
+    # ignore the chain string. Only MpvBackend actually applies it.
+    def set_audio_filter_chain(self, chain: str) -> None:
+        return None
+
     def shutdown(self) -> None:
         return None
 

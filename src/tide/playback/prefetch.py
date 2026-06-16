@@ -25,7 +25,7 @@ from __future__ import annotations
 import time
 from typing import Optional, TYPE_CHECKING
 
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QModelIndex, QObject, QThread, QTimer, Qt, Signal
 
 from ..sources import registry as source_registry
 
@@ -130,6 +130,55 @@ class StreamPrefetch(QObject):
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.start()
+
+    def attach_hover(self, view, debounce_ms: int = 300) -> None:
+        """Wire mouse-hover prefetch to a track-bearing QListView.
+
+        Mouseover on a row warms its URL after a short debounce so a
+        subsequent click on that row hits the cache instantly. Reused
+        from every view that renders ``TrackRowDelegate`` (search
+        results, queue, library, history, album, artist).
+
+        Idempotent — calling twice on the same view is harmless because
+        the second `entered` connection just races the first into the
+        same dedupe-by-video_id pipeline.
+        """
+        if view is None:
+            return
+        try:
+            view.viewport().setMouseTracking(True)
+        except Exception:
+            return
+        # Per-view debounce timer parented on us so it survives the
+        # view's lifetime if the view is reparented or hidden, and
+        # tears down cleanly when the prefetcher shuts down.
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(debounce_ms)
+        # Single-cell list as a closure-mutable container — avoids
+        # `nonlocal` and the noqa Qt closures sometimes need.
+        pending: list = [None]
+
+        def _on_entered(idx: QModelIndex) -> None:
+            from ..api import Track
+            if not idx.isValid():
+                return
+            track = idx.data(Qt.UserRole)
+            if not isinstance(track, Track):
+                return
+            pending[0] = track
+            timer.start()
+
+        def _on_fire() -> None:
+            tr = pending[0]
+            if tr is not None:
+                self.request(tr)
+
+        try:
+            view.entered.connect(_on_entered)
+        except Exception:
+            return
+        timer.timeout.connect(_on_fire)
 
     def invalidate(self, video_id: str) -> None:
         """Drop a single cached entry. Used when a previous lookup turned

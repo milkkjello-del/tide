@@ -18,6 +18,7 @@ DATA_DIR: Path = _xdg("XDG_DATA_HOME", ".local/share") / APP_NAME
 
 OAUTH_FILE: Path = CONFIG_DIR / "oauth.json"
 BROWSER_AUTH_FILE: Path = CONFIG_DIR / "browser.json"
+SPOTIFY_AUTH_FILE: Path = CONFIG_DIR / "spotify.json"
 WEBVIEW_PROFILE_DIR: Path = DATA_DIR / "webview"
 SETTINGS_FILE: Path = CONFIG_DIR / "settings.toml"
 STREAM_CACHE_FILE: Path = CACHE_DIR / "streams.json"

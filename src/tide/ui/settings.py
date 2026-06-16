@@ -204,6 +204,12 @@ class SettingsDialog(QDialog):
             "preserve pitch when changing speed"
         )
 
+        # UI sounds — short clicks on nav / modals / toggles. Auto-muted
+        # while music is playing so they never compete with the player.
+        self.ui_sounds_toggle = QCheckBox(
+            "ui sounds (nav · modals · toggles · auto-mutes during playback)"
+        )
+
         appearance_form = QFormLayout()
         appearance_form.addRow("theme:", self.theme_picker)
         appearance_form.addRow("layout:", self.layout_picker)
@@ -220,6 +226,7 @@ class SettingsDialog(QDialog):
         appearance_form.addRow("font:", self.font_picker)
         appearance_form.addRow("loading bar:", self.loading_picker)
         appearance_form.addRow("motion:", self.motion_picker)
+        appearance_form.addRow("", self.ui_sounds_toggle)
         appearance_form.addRow("ui scale:", self.scale_picker)
         appearance_form.addRow("speed:", self.preserve_pitch_toggle)
         appearance_form.addRow("visualizer audio:", self.audio_device_picker)
@@ -293,6 +300,22 @@ class SettingsDialog(QDialog):
         lb_col.addWidget(self.lb_toggle)
         lb_col.addLayout(lb_token_row)
         lb_col.addWidget(lb_explainer)
+
+        # ---- audio fx ----
+        audio_fx_heading = QLabel("── audio fx ──────────────────")
+        audio_fx_heading.setProperty("class", "dim")
+        fx_blurb = QLabel(
+            "10-band eq + reverb + loudness norm + the rest of the rack.\n"
+            "open the full panel with ctrl+9, or use the [fx] popover on the now-playing strip."
+        )
+        fx_blurb.setProperty("class", "dim")
+        fx_blurb.setWordWrap(True)
+        self.audio_fx_open_btn = QPushButton("open audio fx panel  →")
+        self.audio_fx_open_btn.clicked.connect(self._on_open_audio_fx)
+        audio_fx_col = QVBoxLayout()
+        audio_fx_col.setSpacing(6)
+        audio_fx_col.addWidget(fx_blurb)
+        audio_fx_col.addWidget(self.audio_fx_open_btn, alignment=Qt.AlignLeft)
 
         # ---- advanced ----
         advanced_heading = QLabel("── advanced ──────────────────")
@@ -377,6 +400,9 @@ class SettingsDialog(QDialog):
         content_col.addWidget(lb_heading)
         content_col.addLayout(lb_col)
         content_col.addSpacing(6)
+        content_col.addWidget(audio_fx_heading)
+        content_col.addLayout(audio_fx_col)
+        content_col.addSpacing(6)
         content_col.addWidget(advanced_heading)
         content_col.addLayout(adv_col)
         content_col.addSpacing(6)
@@ -457,6 +483,7 @@ class SettingsDialog(QDialog):
             self.scale_picker.setCurrentIndex(scale_idx)
 
         self.preserve_pitch_toggle.setChecked(bool(self._settings.preserve_pitch))
+        self.ui_sounds_toggle.setChecked(bool(self._settings.ui_sounds_enabled))
         self.adaptive_bg_toggle.setChecked(bool(self._settings.adaptive_background))
         corner_idx = self.corner_picker.findData(self._settings.corner_style or "sharp")
         if corner_idx >= 0:
@@ -549,6 +576,7 @@ class SettingsDialog(QDialog):
         self._settings.motion = self.motion_picker.currentData() or "lite"
         self._settings.ui_scale = self.scale_picker.currentData() or "normal"
         self._settings.preserve_pitch = self.preserve_pitch_toggle.isChecked()
+        self._settings.ui_sounds_enabled = self.ui_sounds_toggle.isChecked()
         self._settings.adaptive_background = self.adaptive_bg_toggle.isChecked()
         self._settings.corner_style = self.corner_picker.currentData() or "sharp"
         self._settings.nav_icon_set = self.nav_icons_picker.currentData() or "off"
@@ -585,6 +613,20 @@ class SettingsDialog(QDialog):
             self, "tide",
             "signed out. quit tide and start it again to sign back in.",
         )
+
+    def _on_open_audio_fx(self) -> None:
+        """Close this dialog + jump to the full audio FX panel. Settings
+        dialog is modal so we save first; the FX panel mutates state
+        without needing this dialog reopened."""
+        self._on_save()
+        win = self.parent()
+        while win is not None and not hasattr(win, "_switch_view"):
+            win = win.parent()
+        if win is not None:
+            try:
+                win._switch_view("audio_fx")
+            except Exception:
+                pass
 
     # ---------- result ----------
 

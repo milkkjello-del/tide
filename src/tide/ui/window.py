@@ -209,6 +209,29 @@ class _RateWorker(QObject):
             self.failed.emit(self.video_id, str(exc))
 
 
+class _InstrumentalSearchWorker(QObject):
+    """Off-main-thread instrumental hunter for the karaoke mute toggle.
+
+    The search method is a synchronous loop over enabled sources; running
+    it on the GUI thread would freeze the UI for the round-trips. Same
+    QThread + worker lifetime pattern as the other workers in this file.
+    """
+    done = Signal(object, object)        # vocal_track, InstrumentalMatch|None
+    failed = Signal(object, str)         # vocal_track, msg
+
+    def __init__(self, vocal_track: api.Track) -> None:
+        super().__init__()
+        self.vocal_track = vocal_track
+
+    def run(self) -> None:
+        try:
+            from .. import instrumental as _inst
+            match = _inst.find_instrumental(self.vocal_track)
+            self.done.emit(self.vocal_track, match)
+        except Exception as exc:
+            self.failed.emit(self.vocal_track, str(exc))
+
+
 # ---------- main window ----------
 
 
@@ -276,6 +299,9 @@ class MainWindow(QMainWindow):
         self._wire_player()
         self._wire_queue()
         self._wire_shortcuts()
+        # Has to come AFTER _build_ui because hover-prefetch needs all
+        # the track-bearing list views to exist on self / its children.
+        self._wire_hover_prefetch()
 
     # ---------- layout ----------
 
@@ -466,6 +492,23 @@ class MainWindow(QMainWindow):
 
         # ----- lyrics view -----
         self.lyrics_view = LyricsView(self.api)
+        # "mute lyrics" instrumental-swap. The view emits when the user
+        # toggles the button; MainWindow owns the player + source
+        # registry so the actual hunt + swap lands here.
+        self.lyrics_view.toggle_instrumental_requested.connect(
+            self._on_instrumental_swap_requested
+        )
+        # Swap state — remembers what to switch back to + the position
+        # at the moment of swap so toggling off resumes mid-song.
+        self._instrumental_swap_thread: QThread | None = None
+        self._instrumental_swap_worker: QObject | None = None
+        self._instrumental_vocal_track = None
+        self._instrumental_swap_position: float = 0.0
+        self._instrumental_active: bool = False
+        # Used by the karaoke "mute lyrics" swap + by any future feature
+        # that needs to load a track and snap to a non-zero start point
+        # on first PLAYING (e.g. session-restore mid-track).
+        self._pending_seek: float = 0.0
 
         # ----- history view -----
         self.history_view = HistoryView()
@@ -525,6 +568,11 @@ class MainWindow(QMainWindow):
         self.source_view.settings_changed.connect(self._refresh_search_placeholder)
         self.source_view.local_dir_changed.connect(self._on_local_dir_changed)
 
+        # ----- audio FX panel -----
+        from .audio_fx_view import AudioFxView
+        self.audio_fx_view = AudioFxView()
+        self.audio_fx_view.state_changed.connect(self._on_audio_fx_state_changed)
+
         # ----- stack -----
         # search_view contains both the search bar AND explore shelves, so
         # there's no separate explore index. The old idx 5 slot is held by
@@ -541,6 +589,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.artist_view)       # 7
         self.stack.addWidget(self.visualizer_view)   # 8
         self.stack.addWidget(self.source_view)       # 9
+        self.stack.addWidget(self.audio_fx_view)     # 10 — v1.2.2 audio FX rack
 
         # Simple back stack of previous indices so AlbumView/ArtistView can pop.
         self._view_history: list[int] = []
@@ -608,6 +657,14 @@ class MainWindow(QMainWindow):
         from .speed import SpeedButton
         self.speed_btn = SpeedButton()
         self.speed_btn.speed_changed.connect(self._on_speed_changed)
+
+        # Audio FX rack quick-access button — opens the small popover with
+        # preset / reverb / bass / treble. Right-click toggles the master
+        # rack on/off. The full panel (Ctrl+9) shares the same state
+        # object via app.py.
+        from .audio_fx_popover import AudioFxButton
+        self.audio_fx_btn = AudioFxButton()
+        self.audio_fx_btn.state_changed.connect(self._on_audio_fx_state_changed)
 
         self.time_label = QLabel("0:00 / 0:00")
         self.time_label.setProperty("class", "dim")
@@ -746,32 +803,61 @@ class MainWindow(QMainWindow):
 
     # ---------- nav ----------
 
+    def _ui_sound(self, key: str) -> None:
+        """Forward to the optional UiSoundPlayer attached by app.py. No-op
+        in headless/test contexts where it was never bound, or when the
+        master toggle / music-playing mute is in effect (the player's
+        own guards handle those)."""
+        player = getattr(self, "ui_sounds", None)
+        if player is not None:
+            try:
+                player.play(key)
+            except Exception:
+                pass
+
+    def _set_stack_index(self, target: int) -> None:
+        """Switch the central stack with a motion-aware crossfade. The
+        motion module short-circuits to a synchronous index swap when
+        intensity is 'off', so this is one line for all three settings."""
+        if self.stack.currentIndex() == target:
+            return
+        from . import motion as motion_module
+        try:
+            motion_module.crossfade_stack(
+                self.stack, target, dur=motion_module.DUR_SHORT,
+            )
+        except Exception:
+            self.stack.setCurrentIndex(target)
+
     def _switch_view(self, name: str) -> None:
         # Recording the previous root view for the back-stack — never push
         # transient detail pages.
         prev = self.stack.currentIndex()
+        self._ui_sound("nav")
         if name in ("home", "search", "explore"):
-            self.stack.setCurrentIndex(0)
+            self._set_stack_index(0)
             self.explore_view.ensure_loaded()
             if name == "search":
                 self.search.setFocus()
         elif name == "library":
-            self.stack.setCurrentIndex(1)
+            self._set_stack_index(1)
             if self.library_view.playlists_list.count() == 0:
                 self.library_view.reload_playlists()
         elif name == "queue":
-            self.stack.setCurrentIndex(2)
+            self._set_stack_index(2)
         elif name == "lyrics":
-            self.stack.setCurrentIndex(3)
+            self._set_stack_index(3)
             self.lyrics_view.show_for(self._current)
         elif name == "history":
-            self.stack.setCurrentIndex(4)
+            self._set_stack_index(4)
             self.history_view.reload()
         elif name == "visualizer":
-            self.stack.setCurrentIndex(8)
+            self._set_stack_index(8)
         elif name == "source":
-            self.stack.setCurrentIndex(9)
+            self._set_stack_index(9)
             self.source_view.refresh_statuses()
+        elif name == "audio_fx":
+            self._set_stack_index(10)
         # Reset back-stack on root-level navigation so [back] doesn't
         # bounce between top-level views.
         if prev in (6, 7) and self.stack.currentIndex() not in (6, 7):
@@ -780,14 +866,15 @@ class MainWindow(QMainWindow):
     def _push_view(self, target_index: int) -> None:
         if self.stack.currentIndex() != target_index:
             self._view_history.append(self.stack.currentIndex())
-            self.stack.setCurrentIndex(target_index)
+            self._set_stack_index(target_index)
 
     def _go_back(self) -> None:
+        self._ui_sound("back")
         if self._view_history:
-            self.stack.setCurrentIndex(self._view_history.pop())
+            self._set_stack_index(self._view_history.pop())
         else:
             # Fallback: go to search.
-            self.stack.setCurrentIndex(0)
+            self._set_stack_index(0)
 
     # ---------- search ----------
 
@@ -1101,6 +1188,23 @@ class MainWindow(QMainWindow):
         # playing for the 1–3s the resolve worker takes, which feels broken
         # on a manual skip.
         self.player.stop()
+        # If a karaoke swap is active and the user picked an unrelated
+        # track (not the swap target, not the cached vocal), clear the
+        # swap state so the mute-lyrics button doesn't get stuck on a
+        # song it's not swapped from. _swapping_now guards the play
+        # calls coming FROM the swap orchestration itself.
+        if (self._instrumental_active
+                and self._instrumental_vocal_track is not None
+                and not getattr(self, "_swapping_now", False)):
+            vocal_id = self._instrumental_vocal_track.video_id
+            if track.video_id != vocal_id:
+                self._instrumental_active = False
+                self._instrumental_vocal_track = None
+                try:
+                    self.lyrics_view.mute_btn.setChecked(False)
+                    self.lyrics_view.swap_status.setText("")
+                except Exception:
+                    pass
         self._current = track
         self.now_label.setTrackAnimated(track.artists, track.title, track.album)
         self.now_label.setStatus("loading")
@@ -1267,6 +1371,178 @@ class MainWindow(QMainWindow):
     def _on_queue_current_changed(self, _track) -> None:
         self._refresh_nav_buttons()
         self._refresh_up_next()
+        # Neighborhood prefetch — keep the next two and the previous one
+        # warm on every queue transition so back/next/queue-jump feel
+        # instant. The position-tick prefetch only arms one track at a
+        # time, near end-of-current; this catches the "user jumps to a
+        # random queue slot mid-song" case the tick-based logic misses.
+        self._arm_neighborhood_prefetch()
+
+    # ---------- instrumental swap ("mute lyrics") ----------
+
+    def _on_instrumental_swap_requested(self, vocal_track, want_instrumental: bool) -> None:
+        """Driven by the Lyrics view's [mute lyrics] toggle. When
+        switching ON, we kick a background instrumental hunt; on
+        success the player swaps stream + restores position. When
+        switching OFF, we restore the previously-cached vocal track."""
+        if want_instrumental:
+            if vocal_track is None:
+                self.lyrics_view.mute_btn.setChecked(False)
+                return
+            # Remember where to come back to.
+            self._instrumental_vocal_track = vocal_track
+            try:
+                self._instrumental_swap_position = float(self.player.position if hasattr(self.player, "position") else 0.0)
+            except Exception:
+                self._instrumental_swap_position = 0.0
+            self._spawn_instrumental_search(vocal_track)
+            return
+        # Toggling OFF — switch back to the vocal version we cached
+        # when the swap was triggered.
+        if not self._instrumental_active or self._instrumental_vocal_track is None:
+            self.lyrics_view.swap_status.setText("")
+            return
+        vocal = self._instrumental_vocal_track
+        # Capture current position so the swap-back lands where the
+        # user was singing (instead of restarting the vocal track).
+        try:
+            current_pos = float(self.player.position if hasattr(self.player, "position") else 0.0)
+        except Exception:
+            current_pos = self._instrumental_swap_position
+        self._instrumental_active = False
+        self._instrumental_vocal_track = None
+        self.lyrics_view.swap_status.setText("")
+        self._instrumental_swap_position = current_pos
+        # Reuse the standard play path; once it loads, _seek_after_load
+        # snaps to the saved position.
+        self._play_track_then_seek(vocal, current_pos)
+
+    def _spawn_instrumental_search(self, vocal_track) -> None:
+        # Cancel any in-flight hunt.
+        old = self._instrumental_swap_thread
+        if old is not None:
+            try:
+                old.quit()
+            except Exception:
+                pass
+        thread = QThread(self)
+        worker = _InstrumentalSearchWorker(vocal_track)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(self._on_instrumental_found)
+        worker.failed.connect(self._on_instrumental_failed)
+        worker.done.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._instrumental_swap_thread = thread
+        self._instrumental_swap_worker = worker
+        thread.start()
+
+    def _on_instrumental_found(self, vocal_track, match) -> None:
+        # Sanity check — did the user toggle off / change tracks while
+        # the search was running?
+        if (vocal_track is None
+                or self._current is None
+                or vocal_track.video_id != self._current.video_id
+                or not self.lyrics_view.mute_btn.isChecked()):
+            return
+        if match is None:
+            self.lyrics_view.mute_btn.setChecked(False)
+            self.lyrics_view.swap_status.setText(theming.styled_case(
+                "no instrumental version found across enabled sources"
+            ))
+            self._instrumental_vocal_track = None
+            return
+        self._instrumental_active = True
+        self.lyrics_view.swap_status.setText(theming.styled_case(
+            f"playing instrumental · source: {match.source_name}"
+        ))
+        # Swap. The instrumental's track carries its own source slug, so
+        # the existing playback router picks the right backend without
+        # any special-casing here.
+        self._play_track_then_seek(match.track, self._instrumental_swap_position)
+
+    def _on_instrumental_failed(self, vocal_track, msg: str) -> None:
+        if vocal_track is None or self._current is None:
+            return
+        if vocal_track.video_id != self._current.video_id:
+            return
+        self.lyrics_view.mute_btn.setChecked(False)
+        self.lyrics_view.swap_status.setText(theming.styled_case(
+            f"instrumental search failed: {msg}"
+        ))
+        self._instrumental_vocal_track = None
+
+    def _play_track_then_seek(self, track, seek_secs: float) -> None:
+        """Play ``track`` and snap to ``seek_secs`` the moment the
+        stream is live. Used by the karaoke swap so the swap-in / swap-
+        out feel like a crossfade-in-place rather than a track restart.
+        """
+        self._pending_seek = max(0.0, float(seek_secs or 0.0))
+        # Tell _play_track this is a swap dispatch, not a user pick,
+        # so it doesn't clear the karaoke swap state during the
+        # transition.
+        self._swapping_now = True
+        try:
+            self._play_track(track)
+        finally:
+            self._swapping_now = False
+        # The seek itself fires in _on_state_changed when state goes to
+        # PLAYING — see _maybe_apply_pending_seek.
+
+    def _maybe_apply_pending_seek(self, state) -> None:
+        """Companion to _play_track_then_seek — fires on first PLAYING
+        after the seek was requested, then clears the pending value."""
+        from ..player import PlayState
+        if getattr(self, "_pending_seek", 0.0) <= 0.0:
+            return
+        if state != PlayState.PLAYING:
+            return
+        try:
+            self.player.seek(float(self._pending_seek))
+        except Exception:
+            pass
+        self._pending_seek = 0.0
+
+    def _wire_hover_prefetch(self) -> None:
+        """Hover-prefetch every track-bearing view in the app. Mouseover
+        a row in any of these → its URL resolves in the background after
+        a 300ms debounce, so the next click is a cache hit."""
+        views: list = [self.results, self.queue_view]
+        for child_view, attr in (
+            (getattr(self, "library_view", None), "tracks_list"),
+            (getattr(self, "history_view", None), "list"),
+            (getattr(self, "album_view", None), "tracks"),
+            (getattr(self, "artist_view", None), "songs"),
+        ):
+            if child_view is None:
+                continue
+            v = getattr(child_view, attr, None)
+            if v is not None:
+                views.append(v)
+        for v in views:
+            try:
+                self._prefetch.attach_hover(v)
+            except Exception:
+                pass
+
+    def _arm_neighborhood_prefetch(self) -> None:
+        idx = self.queue.current_index
+        tracks = self.queue.tracks
+        seen: set[str] = set()
+        for offset in (1, 2, -1):
+            i = idx + offset
+            if i < 0 or i >= len(tracks):
+                continue
+            tr = tracks[i]
+            if not tr or not tr.video_id or tr.video_id in seen:
+                continue
+            seen.add(tr.video_id)
+            try:
+                self._prefetch.request(tr)
+            except Exception:
+                pass
 
     def _refresh_up_next(self) -> None:
         nxt_idx = self.queue.current_index + 1
@@ -1288,6 +1564,14 @@ class MainWindow(QMainWindow):
         self._refresh_up_next()
 
     def _on_radio_refill_requested(self, seed_video_id: str, exclude: list) -> None:
+        # Sources without the "radio" capability can't refill — most
+        # commonly Spotify in Dev Mode, whose recommendations + artist-
+        # top-tracks endpoints were locked behind Extended Quota in Feb
+        # 2026. Skip silently here so the queue doesn't enter a tight
+        # 403-loop trying to refill from an unsupported source.
+        if not self.api.supports("radio"):
+            self.queue.disable_radio()
+            return
         thread = QThread(self)
         worker = _RadioWorker(self.api, seed_video_id, list(exclude))
         worker.moveToThread(thread)
@@ -1364,6 +1648,10 @@ class MainWindow(QMainWindow):
         self.player.error.connect(self._on_player_error)
 
     def _on_state(self, s: PlayState) -> None:
+        # First chance to apply a pending karaoke-swap seek — the player
+        # ignores seek() in LOADING because there's no demuxer yet, so
+        # we wait for PLAYING.
+        self._maybe_apply_pending_seek(s)
         if s == PlayState.PLAYING:
             self.play_btn.setLabel("pause")
             self.play_btn.setGlyph("⏸")
@@ -1507,6 +1795,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+6"), self, lambda: self._switch_view("home"))
         QShortcut(QKeySequence("Ctrl+7"), self, lambda: self._switch_view("visualizer"))
         QShortcut(QKeySequence("Ctrl+8"), self, lambda: self._switch_view("source"))
+        QShortcut(QKeySequence("Ctrl+9"), self, lambda: self._switch_view("audio_fx"))
         QShortcut(QKeySequence("F11"), self, self._toggle_visualizer_fullscreen)
         QShortcut(QKeySequence("Ctrl+,"), self, self.open_settings)
         QShortcut(QKeySequence("Space"), self, self.player.toggle)
@@ -1580,6 +1869,65 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _on_audio_fx_state_changed(self, state) -> None:
+        """Fan a state change from either FX widget out to: (a) the
+        playback router (which pushes the rebuilt filter chain into mpv),
+        (b) the OTHER FX widget so its controls reflect the same state,
+        (c) the persisted Settings.audio_fx_state JSON (debounced to
+        avoid a TOML write on every EQ-slider tick)."""
+        from ..audio_fx import build_filter_chain
+        # 1. apply
+        try:
+            self.player.set_audio_filter_chain(build_filter_chain(state))
+        except Exception:
+            pass
+        # 2. mirror — the two widgets share the dataclass instance, but
+        # their bound widgets still need to repaint to reflect mutations
+        # the OTHER widget made. blockSignals inside sync_from_state /
+        # sync prevents a re-emit loop.
+        sender = self.sender()
+        if sender is not self.audio_fx_view:
+            self.audio_fx_view.sync_from_state()
+        if sender is not self.audio_fx_btn:
+            self.audio_fx_btn.set_state(state, emit=False)
+        else:
+            # The button forwards from its popover — refresh its own label
+            # in case the master toggled.
+            self.audio_fx_btn._refresh_label()
+        # 3. persist (debounced).
+        self._schedule_audio_fx_save(state)
+
+    def _schedule_audio_fx_save(self, state) -> None:
+        # Lazy-init the QTimer so we don't pay the construction cost on
+        # every state change. 250 ms debounce — feels instant to the user
+        # and means dragging an EQ slider writes the TOML twice instead
+        # of 60 times a second.
+        from PySide6.QtCore import QTimer as _QT
+        timer = getattr(self, "_audio_fx_save_timer", None)
+        if timer is None:
+            timer = _QT(self)
+            timer.setInterval(250)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._flush_audio_fx_state)
+            self._audio_fx_save_timer = timer
+        self._pending_audio_fx_state = state
+        timer.start()
+
+    def _flush_audio_fx_state(self) -> None:
+        state = getattr(self, "_pending_audio_fx_state", None)
+        current = getattr(self, "_settings", None)
+        if state is None or current is None:
+            return
+        try:
+            current.audio_fx_state = state.to_json()
+        except Exception:
+            return
+        try:
+            from .. import settings as settings_module
+            settings_module.save(current)
+        except Exception:
+            pass
+
     # ---------- sleep timer ----------
 
     def open_sleep_timer(self) -> None:
@@ -1592,7 +1940,9 @@ class MainWindow(QMainWindow):
                                active_mode=self._sleep_mode, parent=self)
         dlg.started.connect(self._sleep_start)
         dlg.cancelled.connect(self._sleep_cancel)
+        self._ui_sound("modal_open")
         dlg.exec()
+        self._ui_sound("modal_close")
 
     def _sleep_start(self, mode, minutes: int) -> None:
         from .sleep_timer import SleepMode
@@ -1647,6 +1997,7 @@ class MainWindow(QMainWindow):
         controls_row.addWidget(self.next_btn)
         controls_row.addWidget(self.like_btn)
         controls_row.addStretch(1)
+        controls_row.addWidget(self.audio_fx_btn)
         controls_row.addWidget(self.speed_btn)
         controls_row.addWidget(self.volume)
 
@@ -1698,6 +2049,7 @@ class MainWindow(QMainWindow):
         volume_row = QHBoxLayout()
         volume_row.setContentsMargins(0, 0, 0, 0)
         volume_row.addStretch(1)
+        volume_row.addWidget(self.audio_fx_btn)
         volume_row.addWidget(self.speed_btn)
         volume_row.addWidget(self.volume)
         volume_row.addStretch(1)
@@ -1986,11 +2338,17 @@ class MainWindow(QMainWindow):
             from .. import settings as settings_module
             current = settings_module.load()
         dlg = SettingsDialog(current, parent=self)
+        self._ui_sound("modal_open")
         result = dlg.exec()
+        self._ui_sound("modal_close")
         if result != dlg.DialogCode.Accepted:
             return
         new = dlg.updated_settings()
         self._settings = new
+        # Hot-swap the UI sounds master toggle.
+        ui_sounds = getattr(self, "ui_sounds", None)
+        if ui_sounds is not None:
+            ui_sounds.set_enabled(bool(new.ui_sounds_enabled))
         # Push discord changes to the live presence client if it's running.
         discord = getattr(self, "_discord", None)
         if discord is not None:

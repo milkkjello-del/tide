@@ -40,6 +40,14 @@ class Player(QObject):
         _force_c_numeric_locale()
         self._state = PlayState.IDLE
         self._duration = 0.0
+        # Cache + readahead tuned for "tide stays smooth when you skip
+        # mid-song". mpv plays as soon as the demuxer has its first
+        # packet, so the perceived latency is dominated by network round
+        # trips. `cache_secs=20` keeps ~20s ahead in memory so seeking
+        # within that window costs nothing; `demuxer_readahead_secs=10`
+        # makes the demuxer pull aggressively rather than the default 1s
+        # trickle; `demuxer_max_bytes` is bumped to 150MB so high-bitrate
+        # FLACs / long mixes don't churn the cache.
         self._mpv = mpv.MPV(
             ytdl=False,
             video=False,
@@ -48,7 +56,10 @@ class Player(QObject):
             input_default_bindings=False,
             input_vo_keyboard=False,
             cache="yes",
-            demuxer_max_bytes=str(50 * 1024 * 1024),
+            cache_secs="20",
+            demuxer_readahead_secs="10",
+            demuxer_max_bytes=str(150 * 1024 * 1024),
+            audio_buffer="0.1",
             audio_client_name="tide",
         )
 
@@ -160,6 +171,29 @@ class Player(QObject):
             self._mpv["audio-pitch-correction"] = bool(enabled)
         except Exception:
             pass
+
+    @Slot(str)
+    def set_audio_filter_chain(self, chain: str) -> bool:
+        """Push a comma-separated ffmpeg filter chain into mpv's user
+        ``af`` slot. mpv layers its internal scaletempo + volume around
+        this chain, so speed + EQ + reverb + loudness all compose.
+
+        Returns True on success, False if mpv rejected the chain (e.g. a
+        typo in a filter name). On rejection the previous chain is left
+        intact and a stderr line surfaces what mpv said.
+        """
+        try:
+            self._mpv["af"] = chain or ""
+            return True
+        except Exception as exc:
+            # The previous chain is still active because mpv only swaps
+            # on successful parse. Tell the caller so the UI can revert.
+            try:
+                import sys
+                print(f"tide: af parse rejected: {exc}", file=sys.stderr)
+            except Exception:
+                pass
+            return False
 
     def shutdown(self) -> None:
         try:

@@ -345,8 +345,9 @@ class SourcePanel(QWidget):
             row.gear_clicked.connect(self._on_row_gear)
             rows_col.addWidget(row)
 
-        # Future-source placeholders.
-        rows_col.addWidget(_PlaceholderRow("spotify", "v1.2.1 — premium via librespot"))
+        # Future-source placeholder. Spotify used to be a placeholder
+        # here too — in v1.2.1 it became a real (registered, but shelved)
+        # source so the row above renders it directly via _SourceRow.
         rows_col.addWidget(_PlaceholderRow("apple music", "v1.2.2 — musickit js"))
 
         rows_wrap = QWidget()
@@ -364,10 +365,49 @@ class SourcePanel(QWidget):
         col.addWidget(self.federate_box)
         col.addWidget(scroll, stretch=1)
         self.setLayout(col)
+        # Fire deferred reachability probes for sources whose
+        # status depends on a network round-trip (currently Subsonic). The
+        # source's is_authenticated() is now cheap so the row mounts
+        # instantly with the dot in "unknown" state; the probe runs on a
+        # background worker and we refresh statuses once it lands.
+        QTimer.singleShot(0, self._probe_async_sources)
 
     # ---------- slots ----------
 
+    def _ui_sound(self, key: str) -> None:
+        """Walk up the parent chain looking for the top-level window's
+        UiSoundPlayer. Silent no-op if it isn't there yet (e.g. during
+        construction before app.py attaches it, or in tests)."""
+        w = self.window()
+        player = getattr(w, "ui_sounds", None) if w is not None else None
+        if player is not None:
+            try:
+                player.play(key)
+            except Exception:
+                pass
+
     def _on_row_enable(self, slug: str, enabled: bool) -> None:
+        self._ui_sound("toggle_on" if enabled else "toggle_off")
+        # Gate Spotify behind the shelved-state warning. If the user
+        # backs out, roll the row's checkbox back to off without
+        # touching the registry or persisting settings.
+        if slug == "spotify" and enabled:
+            from .spotify_signin import confirm_spotify_enable
+            if not confirm_spotify_enable(self):
+                row = self._rows.get(slug)
+                if row is not None:
+                    row.set_enabled_state(False)
+                return
+        # Subsonic needs a server URL + credentials before it's useful.
+        # Toggling it on with empty config opens the connect dialog and
+        # rolls back the checkbox if the user cancels — otherwise enabling
+        # the source would leave the row visible but every call would no-op.
+        if slug == "subsonic" and enabled and not self._subsonic_configured():
+            if not self._run_subsonic_setup():
+                row = self._rows.get(slug)
+                if row is not None:
+                    row.set_enabled_state(False)
+                return
         reg = source_registry()
         reg.set_enabled(slug, enabled)
         self._settings.sources_enabled[slug] = enabled
@@ -379,6 +419,24 @@ class SourcePanel(QWidget):
 
     def _on_row_activate(self, slug: str) -> None:
         reg = source_registry()
+        # Make-active also enables; gate Spotify behind the same warning
+        # so users can't end up with it as the default active source
+        # without acknowledging the shelved state first.
+        if slug == "spotify" and not reg.is_enabled(slug):
+            from .spotify_signin import confirm_spotify_enable
+            if not confirm_spotify_enable(self):
+                row = self._rows.get(slug)
+                if row is not None:
+                    row.set_active_state(False)
+                return
+        # Same gate for Subsonic — make-active implies enable, but if
+        # the source isn't configured there's nothing to make active.
+        if slug == "subsonic" and not self._subsonic_configured():
+            if not self._run_subsonic_setup():
+                row = self._rows.get(slug)
+                if row is not None:
+                    row.set_active_state(False)
+                return
         if not reg.is_enabled(slug):
             reg.set_enabled(slug, True)
             self._settings.sources_enabled[slug] = True
@@ -393,12 +451,16 @@ class SourcePanel(QWidget):
         self.settings_changed.emit()
 
     def _on_federate_toggle(self, checked: bool) -> None:
+        self._ui_sound("toggle_on" if checked else "toggle_off")
         self._settings.federated_search = checked
         self.settings_changed.emit()
 
     def _on_row_gear(self, slug: str) -> None:
         if slug == "local":
             self._configure_local()
+            return
+        if slug == "subsonic":
+            self._run_subsonic_setup()
             return
         reg = source_registry()
         source = reg.get(slug)
@@ -421,6 +483,101 @@ class SourcePanel(QWidget):
         if row is not None:
             row.refresh_status()
             row._refresh_dot(reg.is_enabled(slug))
+
+    # ---------- subsonic ----------
+
+    def _probe_async_sources(self) -> None:
+        """Kick off non-blocking probes for sources whose connection
+        state depends on a network call. Currently Subsonic only — the
+        others either check local state (local files, ytmusic cookie) or
+        are fast in-process token checks (spotify)."""
+        from ..sources.subsonic import SubsonicSource
+        reg = source_registry()
+        source = reg.get("subsonic")
+        if not isinstance(source, SubsonicSource):
+            return
+        if not self._subsonic_configured():
+            return
+
+        panel = self
+
+        class _Job(QRunnable):
+            def run(self_inner):
+                try:
+                    source.probe()
+                except Exception:
+                    pass
+                # Marshal the row refresh back to the GUI thread.
+                QTimer.singleShot(0, panel.refresh_statuses)
+                QTimer.singleShot(0, lambda: panel._refresh_dot_for("subsonic"))
+
+        QThreadPool.globalInstance().start(_Job())
+
+    def _refresh_dot_for(self, slug: str) -> None:
+        row = self._rows.get(slug)
+        if row is not None:
+            row._refresh_dot(source_registry().is_enabled(slug))
+
+    def _subsonic_configured(self) -> bool:
+        s = self._settings
+        return bool(s.subsonic_url and s.subsonic_user and s.subsonic_pass)
+
+    def _run_subsonic_setup(self) -> bool:
+        """Open the Subsonic connect dialog seeded with the current
+        settings. On save, persist + reconfigure the live source. Returns
+        True iff the user accepted with a complete config.
+
+        Deferred via QTimer.singleShot per the PySide6 + Python 3.14
+        modal-from-click crash pattern documented elsewhere in this file
+        (and observed first on the onboarding wizard) — but here we're
+        invoked from a button click higher up the stack, not directly
+        from a checkbox toggled emission, so we exec() inline and rely on
+        the explicit deleteLater() to drain the dialog's QWidget tree.
+        """
+        from .subsonic_signin import SubsonicSignInDialog
+        from ..sources.subsonic import SubsonicConfig, SubsonicSource
+
+        s = self._settings
+        seed = SubsonicConfig(
+            url=s.subsonic_url, user=s.subsonic_user,
+            password=s.subsonic_pass,
+            auth_style=s.subsonic_auth_style or "salt",
+        )
+        dlg = SubsonicSignInDialog(self, initial=seed)
+        try:
+            accepted = dlg.exec() == QDialog.DialogCode.Accepted
+            cfg = dlg.result_config() if accepted else None
+        finally:
+            dlg.deleteLater()
+        if not accepted or cfg is None or not cfg.is_complete():
+            return False
+
+        # Persist the entered credentials.
+        s.subsonic_url = cfg.url
+        s.subsonic_user = cfg.user
+        s.subsonic_pass = cfg.password
+        s.subsonic_auth_style = cfg.auth_style
+
+        reg = source_registry()
+        source = reg.get("subsonic")
+        if isinstance(source, SubsonicSource):
+            source.set_config(cfg)
+        else:
+            # No source registered yet (e.g. app booted with empty config
+            # and never instantiated one) — wire one up now.
+            reg.register(SubsonicSource(cfg), enabled=False)
+
+        row = self._rows.get("subsonic")
+        if row is not None:
+            row.refresh_status()
+            row._refresh_dot(reg.is_enabled("subsonic"))
+        self.settings_changed.emit()
+        # Kick off a fresh probe so the dot + status line settle to the
+        # post-save state without waiting for the next panel refresh.
+        self._probe_async_sources()
+        return True
+
+    # ---------- local ----------
 
     def _configure_local(self) -> None:
         reg = source_registry()
@@ -488,3 +645,7 @@ class SourcePanel(QWidget):
         self.federate_box.blockSignals(True)
         self.federate_box.setChecked(bool(settings.federated_search))
         self.federate_box.blockSignals(False)
+        # The pre-bind probe ran against the placeholder Settings (empty
+        # subsonic creds) so it short-circuited. Now that the real
+        # settings are in, schedule a fresh probe for the real config.
+        QTimer.singleShot(0, self._probe_async_sources)

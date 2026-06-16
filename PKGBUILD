@@ -1,6 +1,6 @@
 # Maintainer: tide maintainer <you@example.com>
 pkgname=tide
-pkgver=1.2.0.1
+pkgver=1.2.3
 pkgrel=1
 pkgdesc="A brutalist multi-source music desktop client"
 arch=('any')
@@ -17,6 +17,7 @@ depends=(
   'python-numpy'
   'python-sounddevice'
   'python-mutagen'
+  'python-spotipy'
   'ttf-ibm-plex'
 )
 optdepends=(
@@ -24,6 +25,7 @@ optdepends=(
   'python-secretstorage: GNOME/libsecret backend for cookie import'
   'kwallet: KDE wallet backend for cookie import'
   'python-watchdog: live re-indexing of the local files source'
+  'librespot: Spotify Premium playback via the librespot backend'
 )
 makedepends=(
   'python-build'

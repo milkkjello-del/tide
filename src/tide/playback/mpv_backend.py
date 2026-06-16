@@ -50,6 +50,9 @@ class MpvBackend(PlaybackBackend):
     def set_pitch_correction(self, enabled: bool) -> None:
         self._player.set_pitch_correction(enabled)
 
+    def set_audio_filter_chain(self, chain: str) -> None:
+        self._player.set_audio_filter_chain(chain)
+
     def shutdown(self) -> None:
         self._player.shutdown()
 

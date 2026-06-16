@@ -1,0 +1,331 @@
+"""Audio FX state + mpv filter-chain builder.
+
+A pure-Python module — no Qt, no mpv handle, no UI imports — that owns
+the canonical audio-rack state and renders it into the mpv ``af`` (audio
+filter chain) string. The UI (full panel + quick popover) mutates an
+``AudioFxState`` and the playback router pushes ``build_filter_chain()``
+into mpv. Persistence is JSON-in-a-settings-string so the TOML stays
+shallow (the existing serializer doesn't handle lists of dicts).
+
+Filter order in the chain is deliberate:
+    EQ bands → bass shelf → treble shelf → stereo width →
+    compressor → reverb → loudness norm → mono
+
+EQ first to shape the source signal cleanly, shelves next for broad
+tone, then dynamics/space, then loudness leveling at the end, then the
+optional mono fold as the very last step. mpv layers its own scaletempo
++ volume in front of our chain.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field, fields
+from typing import Mapping
+
+
+# ---------- frequencies + bands ----------
+
+# Classic 10-band graphic EQ centers. Each band is ~1 octave from the
+# next; we set the per-band width to half an octave so adjacent bands
+# overlap gently — typical graphic-EQ feel.
+EQ_FREQUENCIES_HZ: tuple[int, ...] = (
+    32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000,
+)
+EQ_BAND_COUNT = len(EQ_FREQUENCIES_HZ)
+# Gain range exposed to the UI. ffmpeg's `equalizer` accepts a wider
+# range but anything past ±12 dB sounds destroyed.
+EQ_GAIN_MIN_DB = -12.0
+EQ_GAIN_MAX_DB = 12.0
+# Octave width per band — half-octave gives the smooth-overlapping
+# response a classic graphic EQ has.
+EQ_BAND_WIDTH_OCTAVES = 0.5
+
+
+def _flat_bands() -> list[float]:
+    return [0.0] * EQ_BAND_COUNT
+
+
+# ---------- EQ presets ----------
+
+# Each preset is a list of 10 dB values aligned with EQ_FREQUENCIES_HZ.
+# Values curated to be obvious-but-musical at ±6 dB peaks.
+EQ_PRESETS: dict[str, list[float]] = {
+    "flat":          [0,  0,  0,  0,  0,  0,  0,  0,  0,  0],
+    "bass boost":    [6,  5,  4,  2,  0,  0,  0,  0,  0,  0],
+    "treble boost":  [0,  0,  0,  0,  0,  0,  2,  4,  5,  6],
+    "vocal boost":   [-2, -2, -1, 0,  3,  4,  4,  2,  0, -1],
+    "v-shape":       [5,  4,  2,  0, -2, -2,  0,  2,  4,  5],
+    "soft warmth":   [3,  2,  1,  0, -1, -1, -2, -2, -1,  0],
+}
+
+
+def detect_eq_preset(bands: list[float]) -> str:
+    """Return the preset name whose curve exactly matches ``bands``, or
+    ``"custom"`` if none does. Used by the UI to highlight the active
+    preset card after manual slider edits / preset clicks."""
+    for name, curve in EQ_PRESETS.items():
+        if len(curve) == len(bands) and all(
+            abs(float(a) - float(b)) < 1e-4 for a, b in zip(curve, bands)
+        ):
+            return name
+    return "custom"
+
+
+# ---------- reverb presets ----------
+
+# Each entry is a single ffmpeg ``aecho`` argument string (everything
+# after the ``=``). build_filter_chain() prefixes with "aecho=" and
+# scales the out_gain by ``reverb_wet``.
+#
+# Structure of an aecho arg: in_gain : out_gain : delays_ms : decays
+# Multi-tap delays/decays are pipe-separated. "off" = no reverb.
+REVERB_PRESETS: dict[str, str] = {
+    "off":       "",
+    "room":      "0.8:0.55:35:0.30",
+    "hall":      "0.7:0.65:80|140:0.40|0.30",
+    "cathedral": "0.6:0.75:120|240|360:0.50|0.40|0.30",
+    # Signature tide preset — slower, longer tail, paired well with
+    # speed < 1.0 + pitch-shift off (the "slowed + reverb" aesthetic).
+    "slowed":    "0.7:0.85:90|180|270:0.55|0.45|0.35",
+}
+
+
+# ---------- state ----------
+
+@dataclass
+class CustomSlot:
+    """One user-saved EQ slot. Three of these slots ship; users overwrite
+    them via [save 1/2/3] in the full panel."""
+    name: str = ""
+    bands: list[float] = field(default_factory=_flat_bands)
+
+
+@dataclass
+class AudioFxState:
+    """The whole rack as a plain Python object. Mutated by the UI, read
+    by ``build_filter_chain``, round-tripped to JSON for settings.toml."""
+
+    master_enabled: bool = False
+    eq_bands: list[float] = field(default_factory=_flat_bands)
+    bass_db: float = 0.0
+    treble_db: float = 0.0
+    reverb_preset: str = "off"
+    reverb_wet: float = 0.5
+    loudness_norm: bool = False
+    # 0 (mono) — 1 (normal) — 2 (wide). Stored as the raw extrastereo `m`
+    # value so build_filter_chain can pass it straight through.
+    stereo_width: float = 1.0
+    compressor: bool = False
+    mono: bool = False
+    custom_slots: list[CustomSlot] = field(
+        default_factory=lambda: [CustomSlot() for _ in range(3)]
+    )
+
+    # ---------- helpers ----------
+
+    def apply_eq_preset(self, name: str) -> None:
+        curve = EQ_PRESETS.get(name)
+        if curve is None:
+            return
+        # Copy so the preset table doesn't get mutated by later edits.
+        self.eq_bands = [float(v) for v in curve]
+
+    def load_custom_slot(self, idx: int) -> bool:
+        if not (0 <= idx < len(self.custom_slots)):
+            return False
+        slot = self.custom_slots[idx]
+        if not slot.bands or len(slot.bands) != EQ_BAND_COUNT:
+            return False
+        self.eq_bands = [float(v) for v in slot.bands]
+        return True
+
+    def save_custom_slot(self, idx: int, name: str = "") -> None:
+        if not (0 <= idx < len(self.custom_slots)):
+            return
+        self.custom_slots[idx] = CustomSlot(
+            name=name or f"slot {idx + 1}",
+            bands=[float(v) for v in self.eq_bands],
+        )
+
+    def clear_custom_slot(self, idx: int) -> None:
+        if not (0 <= idx < len(self.custom_slots)):
+            return
+        self.custom_slots[idx] = CustomSlot()
+
+    # ---------- persistence ----------
+
+    def to_dict(self) -> dict:
+        return {
+            "master_enabled": bool(self.master_enabled),
+            "eq_bands": [float(v) for v in self.eq_bands],
+            "bass_db": float(self.bass_db),
+            "treble_db": float(self.treble_db),
+            "reverb_preset": str(self.reverb_preset),
+            "reverb_wet": float(self.reverb_wet),
+            "loudness_norm": bool(self.loudness_norm),
+            "stereo_width": float(self.stereo_width),
+            "compressor": bool(self.compressor),
+            "mono": bool(self.mono),
+            "custom_slots": [
+                {"name": s.name, "bands": [float(v) for v in s.bands]}
+                for s in self.custom_slots
+            ],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping | None) -> "AudioFxState":
+        if not data:
+            return cls()
+        state = cls()
+        if "master_enabled" in data:
+            state.master_enabled = bool(data["master_enabled"])
+        bands = data.get("eq_bands")
+        if isinstance(bands, list) and len(bands) == EQ_BAND_COUNT:
+            state.eq_bands = [_clamp_db(v) for v in bands]
+        state.bass_db = _clamp_db(data.get("bass_db", 0.0))
+        state.treble_db = _clamp_db(data.get("treble_db", 0.0))
+        rv = str(data.get("reverb_preset", "off"))
+        state.reverb_preset = rv if rv in REVERB_PRESETS else "off"
+        state.reverb_wet = max(0.0, min(1.0, float(data.get("reverb_wet", 0.5))))
+        state.loudness_norm = bool(data.get("loudness_norm", False))
+        state.stereo_width = max(0.0, min(2.5, float(data.get("stereo_width", 1.0))))
+        state.compressor = bool(data.get("compressor", False))
+        state.mono = bool(data.get("mono", False))
+        slots = data.get("custom_slots") or []
+        out_slots: list[CustomSlot] = []
+        for raw in slots[:3]:
+            try:
+                name = str(raw.get("name", ""))
+                bs = raw.get("bands") or []
+                if isinstance(bs, list) and len(bs) == EQ_BAND_COUNT:
+                    out_slots.append(CustomSlot(
+                        name=name, bands=[_clamp_db(v) for v in bs],
+                    ))
+                else:
+                    out_slots.append(CustomSlot(name=name))
+            except (AttributeError, TypeError, ValueError):
+                out_slots.append(CustomSlot())
+        # Pad to exactly 3 so the UI's slot row always has 3 buttons.
+        while len(out_slots) < 3:
+            out_slots.append(CustomSlot())
+        state.custom_slots = out_slots
+        return state
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), separators=(",", ":"))
+
+    @classmethod
+    def from_json(cls, payload: str) -> "AudioFxState":
+        if not payload:
+            return cls()
+        try:
+            return cls.from_dict(json.loads(payload))
+        except (ValueError, TypeError):
+            return cls()
+
+
+def _clamp_db(value) -> float:
+    try:
+        return max(EQ_GAIN_MIN_DB, min(EQ_GAIN_MAX_DB, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# ---------- chain builder ----------
+
+# Reverb wet multiplier rule: at wet=0 the preset is bypassed; at wet=1
+# the preset emits its native out_gain. In between we scale the
+# preset's out_gain (the second colon-separated field of the aecho
+# arg) linearly. This is a useful-enough approximation of a dry/wet
+# blend without a parallel filter graph.
+def _scaled_aecho_arg(arg: str, wet: float) -> str | None:
+    if not arg or wet <= 0.0:
+        return None
+    parts = arg.split(":")
+    if len(parts) < 4:
+        return None
+    try:
+        original_out_gain = float(parts[1])
+    except ValueError:
+        return None
+    scaled = max(0.0, min(1.0, float(wet))) * original_out_gain
+    parts[1] = f"{scaled:.3f}"
+    return ":".join(parts)
+
+
+def build_filter_chain(state: AudioFxState) -> str:
+    """Render ``state`` to the mpv ``af`` string. Returns ``""`` when
+    nothing should be applied (master disabled or every knob at default)
+    so mpv stays in fully-bypassed mode.
+
+    Each filter is appended only if it actively does something — a 0 dB
+    EQ band, no-op reverb preset, etc. all get skipped — so the chain
+    we hand mpv is as short as possible.
+    """
+    if not state.master_enabled:
+        return ""
+
+    chain: list[str] = []
+
+    # 1. 10-band graphic EQ (only emit non-zero bands).
+    for freq, gain in zip(EQ_FREQUENCIES_HZ, state.eq_bands):
+        g = float(gain or 0.0)
+        if abs(g) < 0.05:
+            continue
+        chain.append(
+            f"equalizer=f={freq}:t=o:w={EQ_BAND_WIDTH_OCTAVES}:g={g:g}"
+        )
+
+    # 2. Bass shelf at 120 Hz.
+    if abs(state.bass_db) >= 0.05:
+        chain.append(f"bass=g={state.bass_db:g}:f=120")
+
+    # 3. Treble shelf at 8 kHz.
+    if abs(state.treble_db) >= 0.05:
+        chain.append(f"treble=g={state.treble_db:g}:f=8000")
+
+    # 4. Stereo width (1.0 == identity, skip).
+    if abs(state.stereo_width - 1.0) >= 0.01:
+        chain.append(f"extrastereo=m={state.stereo_width:g}")
+
+    # 5. Compressor.
+    if state.compressor:
+        # Conservative defaults that catch peaks without pumping the
+        # signal. makeup=4 dB recovers the headroom the threshold ate.
+        chain.append(
+            "acompressor=threshold=-20dB:ratio=4:attack=20:release=250:makeup=4"
+        )
+
+    # 6. Reverb.
+    aecho_arg = _scaled_aecho_arg(
+        REVERB_PRESETS.get(state.reverb_preset, ""),
+        state.reverb_wet,
+    )
+    if aecho_arg is not None:
+        chain.append(f"aecho={aecho_arg}")
+
+    # 7. Loudness normalization (EBU R128 target -14 LUFS — streaming-
+    # platform-typical so cross-source queues feel level).
+    if state.loudness_norm:
+        chain.append("loudnorm=I=-14:LRA=11:tp=-1.5")
+
+    # 8. Mono fold (channel-collapse via pan filter).
+    if state.mono:
+        chain.append("pan=mono|c0=0.5*c0+0.5*c1")
+
+    return ",".join(chain)
+
+
+__all__ = [
+    "AudioFxState",
+    "CustomSlot",
+    "EQ_BAND_COUNT",
+    "EQ_BAND_WIDTH_OCTAVES",
+    "EQ_FREQUENCIES_HZ",
+    "EQ_GAIN_MAX_DB",
+    "EQ_GAIN_MIN_DB",
+    "EQ_PRESETS",
+    "REVERB_PRESETS",
+    "build_filter_chain",
+    "detect_eq_preset",
+]

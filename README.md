@@ -21,7 +21,7 @@ native Qt6 · 5 sources · 11 themes · 9 visualizers · MPRIS2 · adaptive acce
 
 <img src="assets/screenshots/now-playing-adaptive.png" alt="tide — now playing, adaptive theme with album-tinted gradient" width="780" />
 
-<sub>adaptive theme · album-tinted central gradient · soft corners · v1.2.0.1</sub>
+<sub>adaptive theme · album-tinted central gradient · soft corners · v1.2.1</sub>
 
 </div>
 
@@ -33,7 +33,7 @@ git clone https://github.com/captiencelovesarch/tide.git && cd tide && makepkg -
 
 then launch `tide`, click **`[import]`**, you're listening. that's the whole setup.
 
-> **new in v1.2.0.1** · animations (off / lite / full · track-change scramble + album-art crossfade) · pitch-shifting speed control with popover + presets · UI scale (compact → huge) · adaptive central-area gradient · soft corners option · customizable loading bar · themed nav icons (incl. bundled brutalist SVGs) · 3 bundled fonts + font picker · Discord RP that no longer ticks while songs are still loading · stream-URL prefetch for snappy auto-advance. [full notes →](https://github.com/captiencelovesarch/tide/releases/tag/v1.2.0.1)
+> **note on spotify** · the integration is shipped but shelved — spotify's 2026-02-06 platform-security update started refusing audio-decryption keys to librespot regardless of how it authenticates, so audio plays as silence on every account we've tested. tide can still search the catalog, browse your library, and appear as a Connect device, but enabling spotify pops a confirmation explaining that playback is broken. when (if) spotify reopens or librespot upstream patches it, the integration will start working with no code change.
 
 ---
 
@@ -54,7 +54,8 @@ press `Ctrl+8` for the `[source]` panel — every source is one toggle away.
 | **bandcamp** | `[BC]` | ✓ | — | nothing |
 | **mixcloud** | `[MC]` | ✓ | — | nothing |
 | **local files** | `[LO]` | ✓ | ✓ (by album) | a music directory |
-| spotify | `[SP]` | v1.2.1 | v1.2.1 | premium |
+| **subsonic / navidrome** | `[SS]` | ✓ | ✓ (playlists + albums + artists) | your server's url + login |
+| spotify | `[SP]` | shelved | shelved | broken upstream — see note below |
 | apple music | `[AM]` | v1.2.2 | v1.2.2 | apple id |
 
 queue is source-agnostic. mix a YT Music search, a Bandcamp deep cut, and a local FLAC in the same queue — tide dispatches each to the right backend. **federated search** mode (toggle in the source panel) runs every enabled source in parallel and tags each result row so you can see where the hit came from.
@@ -143,6 +144,8 @@ queue is source-agnostic. mix a YT Music search, a Bandcamp deep cut, and a loca
 - **motion intensity** — `off` / `lite` (default — signature + everyday animations) / `full` (everything including atmospheric). respects `QT_REDUCED_MOTION` and clamps `full` to `lite` when set.
 - **track-change signature** — title decodes left-to-right from random block glyphs while the album art crossfades; layered on top of the existing 1.5s adaptive accent fade for a triple-timeline reveal.
 - **playback speed** — popover with `−0.05` / `+0.05` nudges, preset buttons (`0.5× 0.75× 1.0× 1.25× 1.5× 2.0×`), and a reset. Pitch-shifted by default for the slowed-and-reverb / nightcore vibe; toggle "preserve pitch" in settings for audiobook use. Shortcuts: `[` slow · `]` fast · `\` reset.
+- **audio fx rack** *(new in v1.2.2)* — `Ctrl+9` for the full panel: 10-band graphic EQ (32 Hz → 16 kHz, ±12 dB) with preset cards (`flat / bass boost / treble boost / vocal boost / v-shape / soft warmth`) and 3 user-saved slots, reverb preset bank (`off / room / hall / cathedral / `**`slowed`**) with wet slider, bass + treble shelves, loudness normalization (-14 LUFS), stereo width, compressor, mono fold. Quick `[fx]` popover next to `[speed]` for one-click preset + reverb + bass/treble. Right-click `[fx]` to toggle the whole rack on/off. Pair the **slowed** reverb with playback speed 0.85× + pitch-correction off for the canonical tide signature.
+- **UI sounds + crossfading views** *(new in v1.2.3)* — short percussive sounds on nav clicks, soft pops on modal open/close, chirps on toggle flips. Auto-muted the second music starts playing so they never compete with the player. View switches crossfade instead of snapping. Six bundled WAVs (hand-authored), defaults **off** — opt in via Settings → appearance → "ui sounds".
 - **UI scale** — `compact (0.85×) / normal / large (1.15×) / huge (1.30×)`. cascades through every fixed-size widget (track row, album art, cards, album/artist pages, view margins).
 - **soft corners** — `sharp` / `soft (6px)` / `rounded (12px)` applies a sticky `@radius` override on inputs, scrollbars, and the central-area clip.
 - **customizable loading bar** — five styles in the status bar tracking the resolve → buffer → playing window: `off`, `numbers`, `blocks`, `dots`, `ascii`.
@@ -247,6 +250,7 @@ probably possible, untested, doesn't make sense without MPRIS / kwallet / parec.
 | `Ctrl+↑` / `Ctrl+↓` | volume +/− 5 |
 | `[` / `]` | playback speed −/+ 0.05 |
 | `\` | reset playback speed to 1.0× |
+| `Ctrl+9` | open `[audio fx]` panel — eq + reverb + the rest |
 | `Ctrl+H` | like / unlike current track |
 | `Ctrl+I` | sleep timer dialog |
 | `Ctrl+M` | toggle mini-mode |
@@ -301,8 +305,10 @@ all deps live in Arch's `extra` repo. zero AUR-only python packages. the PKGBUIL
 - [x] **v1.1** — QOL kitchen sink (visualizer, scrobbling, layouts, adaptive accent, tray, history, sleep timer, mini-mode, 11 themes)
 - [x] **v1.2.0** — multi-source: + SoundCloud + Bandcamp + Mixcloud + Local files, source panel, federated search
 - [x] **v1.2.0.1** — pre-spotify glow-up: animations, pitch-shifting speed, UI scale, adaptive central gradient + soft corners, themed nav icons + SVG set, 3 bundled fonts + picker, customizable loading bar, Discord-timer + adaptive-picker fixes, stream-URL prefetch
-- [ ] **v1.2.1** — Spotify (Premium via librespot)
-- [ ] **v1.2.2** — Apple Music (MusicKit JS via embedded webview)
+- [x] **v1.2.1** — Spotify (shelved upstream) + Subsonic / Navidrome (self-hosted music)
+- [x] **v1.2.2** — audio fx rack (10-band eq + reverb + loudness norm + extras), `Ctrl+9`
+- [x] **v1.2.3** — UI sounds (nav clicks + modal pops + toggle chirps, auto-muted during playback) + crossfading view transitions
+- [ ] **v1.2.4** — Apple Music (MusicKit JS via embedded webview)
 
 ## license
 
