@@ -90,10 +90,11 @@ class _SourceRow(QFrame):
         self.status_label.setObjectName("sourceStatus")
         self.status_label.setMinimumWidth(220)
 
-        self.gear_btn = QPushButton("[⚙]")
+        self.gear_btn = QPushButton(styled_case("[settings]"))
         self.gear_btn.setObjectName("sourceGear")
-        self.gear_btn.setFlat(True)
-        self.gear_btn.setFixedWidth(36)
+        self.gear_btn.setFlat(False)
+        self.gear_btn.setMinimumWidth(96)
+        self.gear_btn.setCursor(Qt.PointingHandCursor)
         self.gear_btn.clicked.connect(lambda: self.gear_clicked.emit(self.slug))
 
         self.enable_box = QCheckBox(styled_case("enabled"))
@@ -156,6 +157,61 @@ class _SourceRow(QFrame):
             self.dot.set_state("ok")
         else:
             self.dot.set_state("warn")
+
+
+class _GenericSourceDialog(QDialog):
+    """Per-source [⚙] sub-dialog for sources that don't have richer config.
+
+    Shows: name, status, declared capabilities, and a sign-out button for
+    sources that needs_auth. Mostly a confirmation that the gear works and
+    a place to surface auth state.
+    """
+
+    sign_out_requested = Signal(str)   # slug
+
+    def __init__(self, source, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(source.name)
+        self._source = source
+
+        heading = QLabel(styled_case(source.name))
+        heading.setObjectName("sectionHeading")
+
+        status_lbl = QLabel(styled_case(source.status_text()))
+        status_lbl.setObjectName("sourceStatus")
+        status_lbl.setWordWrap(True)
+
+        caps = sorted(source.capabilities) if source.capabilities else ["search only"]
+        caps_lbl = QLabel(styled_case("capabilities · " + ", ".join(caps)))
+        caps_lbl.setObjectName("sourceStatus")
+        caps_lbl.setWordWrap(True)
+
+        col = QVBoxLayout()
+        col.setContentsMargins(20, 18, 20, 18)
+        col.setSpacing(10)
+        col.addWidget(heading)
+        col.addWidget(status_lbl)
+        col.addWidget(caps_lbl)
+
+        if source.needs_auth and source.is_authenticated():
+            signout_btn = QPushButton(styled_case("[sign out]"))
+            signout_btn.clicked.connect(self._on_signout)
+            col.addWidget(signout_btn)
+        elif not source.needs_auth:
+            note = QLabel(styled_case("public catalog — nothing to configure"))
+            note.setObjectName("sourceStatus")
+            col.addWidget(note)
+
+        col.addStretch(1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        col.addWidget(buttons)
+        self.setLayout(col)
+        self.resize(380, 240)
+
+    def _on_signout(self) -> None:
+        self.sign_out_requested.emit(self._source.slug)
+        self.accept()
 
 
 class _LocalGearDialog(QDialog):
@@ -343,8 +399,28 @@ class SourcePanel(QWidget):
     def _on_row_gear(self, slug: str) -> None:
         if slug == "local":
             self._configure_local()
-        # ytmusic / soundcloud / bandcamp / mixcloud have nothing to configure
-        # at the per-source level in v1.2.0. Future versions can dispatch.
+            return
+        reg = source_registry()
+        source = reg.get(slug)
+        if source is None:
+            return
+        dlg = _GenericSourceDialog(source, self)
+        dlg.sign_out_requested.connect(self._sign_out_source)
+        dlg.exec()
+
+    def _sign_out_source(self, slug: str) -> None:
+        reg = source_registry()
+        source = reg.get(slug)
+        if source is None:
+            return
+        try:
+            source.sign_out()
+        except Exception:
+            pass
+        row = self._rows.get(slug)
+        if row is not None:
+            row.refresh_status()
+            row._refresh_dot(reg.is_enabled(slug))
 
     def _configure_local(self) -> None:
         reg = source_registry()

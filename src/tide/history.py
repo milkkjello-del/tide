@@ -32,6 +32,7 @@ class HistoryEntry:
     duration_seconds: int = 0
     thumbnail: str = ""
     played_at: float = 0.0
+    source: str = "ytmusic"
 
     def to_track(self) -> Track:
         return Track(
@@ -42,6 +43,7 @@ class HistoryEntry:
             duration=self.duration,
             duration_seconds=self.duration_seconds,
             thumbnail=self.thumbnail,
+            source=self.source or "ytmusic",
         )
 
 
@@ -58,6 +60,7 @@ def append(track: Track) -> None:
         "duration": track.duration,
         "duration_seconds": int(track.duration_seconds or 0),
         "thumbnail": track.thumbnail,
+        "source": getattr(track, "source", "") or "ytmusic",
         "played_at": time.time(),
     }
     try:
@@ -116,6 +119,7 @@ def read_recent(limit: int = DEFAULT_TAIL) -> list[HistoryEntry]:
             duration=d.get("duration", ""),
             duration_seconds=int(d.get("duration_seconds") or 0),
             thumbnail=d.get("thumbnail", ""),
+            source=d.get("source") or "ytmusic",
             played_at=float(d.get("played_at") or 0.0),
         ))
     return out

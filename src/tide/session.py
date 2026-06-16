@@ -45,6 +45,7 @@ def _track_to_dict(t: Track) -> dict:
         "duration": t.duration,
         "duration_seconds": t.duration_seconds,
         "thumbnail": t.thumbnail,
+        "source": getattr(t, "source", "") or "ytmusic",
     }
 
 
@@ -57,6 +58,8 @@ def _track_from_dict(d: dict) -> Track:
         duration=d.get("duration", ""),
         duration_seconds=int(d.get("duration_seconds") or 0),
         thumbnail=d.get("thumbnail", ""),
+        # v1.1 sessions lack `source`; default to ytmusic so they still play.
+        source=d.get("source") or "ytmusic",
     )
 
 

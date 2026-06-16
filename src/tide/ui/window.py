@@ -267,8 +267,10 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         # ----- nav rail -----
-        self.nav_search_btn = BracketButton("search")
-        self.nav_explore_btn = BracketButton("explore")
+        # The search view doubles as "home" — search bar + explore shelves
+        # in one surface. Per-tab [explore] disappears as a separate nav
+        # entry; clicking [home] goes there.
+        self.nav_home_btn = BracketButton("home")
         self.nav_library_btn = BracketButton("library")
         self.nav_queue_btn = BracketButton("queue")
         self.nav_lyrics_btn = BracketButton("lyrics")
@@ -276,8 +278,7 @@ class MainWindow(QMainWindow):
         self.nav_visualizer_btn = BracketButton("visualizer")
         self.nav_source_btn = BracketButton("source")
         self.nav_settings_btn = BracketButton("settings")
-        self.nav_search_btn.clicked.connect(lambda: self._switch_view("search"))
-        self.nav_explore_btn.clicked.connect(lambda: self._switch_view("explore"))
+        self.nav_home_btn.clicked.connect(lambda: self._switch_view("home"))
         self.nav_library_btn.clicked.connect(lambda: self._switch_view("library"))
         self.nav_queue_btn.clicked.connect(lambda: self._switch_view("queue"))
         self.nav_lyrics_btn.clicked.connect(lambda: self._switch_view("lyrics"))
@@ -289,8 +290,7 @@ class MainWindow(QMainWindow):
         nav_col = QVBoxLayout()
         nav_col.setContentsMargins(10, 14, 10, 14)
         nav_col.setSpacing(2)
-        nav_col.addWidget(self.nav_search_btn)
-        nav_col.addWidget(self.nav_explore_btn)
+        nav_col.addWidget(self.nav_home_btn)
         nav_col.addWidget(self.nav_library_btn)
         nav_col.addWidget(self.nav_queue_btn)
         nav_col.addWidget(self.nav_lyrics_btn)
@@ -306,9 +306,9 @@ class MainWindow(QMainWindow):
 
         # ----- search view -----
         self.search = QLineEdit()
-        self.search.setPlaceholderText("search youtube music…")
         self.search.returnPressed.connect(self._on_search)
         self.search.setClearButtonEnabled(True)
+        self._refresh_search_placeholder()
 
         self.heading = QLabel(self._line_heading("results"))
         self.heading.setProperty("class", "dim")
@@ -358,16 +358,36 @@ class MainWindow(QMainWindow):
         results_scroll.setVisible(False)
         self._results_card_scroll = results_scroll
 
+        # The search view doubles as "home" — when the search bar is empty,
+        # the explore shelves render below it (YT Music site shape). The
+        # explore_view widget is constructed further down; we add it to the
+        # layout via a placeholder slot and parent it in after it exists.
+        self._home_explore_slot = QVBoxLayout()
+        self._home_explore_slot.setContentsMargins(0, 0, 0, 0)
+        self._home_explore_slot.setSpacing(0)
+
+        # Tabs row stays hidden until the user types something — empty-state
+        # home view just shows shelves.
+        self._tabs_row_widget = QWidget()
+        self._tabs_row_widget.setLayout(tabs_row)
+        self._tabs_row_widget.setVisible(False)
+        self.heading.setVisible(False)
+        self.results.setVisible(False)
+        results_scroll.setVisible(False)
+
         search_col = QVBoxLayout()
         search_col.setContentsMargins(16, 14, 16, 8)
         search_col.setSpacing(8)
         search_col.addWidget(self.search)
-        search_col.addLayout(tabs_row)
+        search_col.addWidget(self._tabs_row_widget)
         search_col.addWidget(self.heading)
         search_col.addWidget(self.results, stretch=1)
         search_col.addWidget(results_scroll, stretch=1)
+        search_col.addLayout(self._home_explore_slot, stretch=1)
         search_view = QWidget()
         search_view.setLayout(search_col)
+        # Hook the search bar's textChanged so clearing returns to home view.
+        self.search.textChanged.connect(self._on_search_text_changed)
 
         # ----- queue view -----
         self.queue_heading = QLabel(self._line_heading("queue"))
@@ -436,6 +456,8 @@ class MainWindow(QMainWindow):
         self.explore_view.artist_requested.connect(self._open_artist_entry)
         self.explore_view.playlist_requested.connect(self._open_playlist_entry)
         self.explore_view.status_message.connect(self._set_status)
+        # Mount explore as the home-view bottom half, below the search bar.
+        self._home_explore_slot.addWidget(self.explore_view, stretch=1)
 
         self.album_view = AlbumView(self.api)
         self.album_view.back_requested.connect(self._go_back)
@@ -473,16 +495,21 @@ class MainWindow(QMainWindow):
         self.source_view.active_changed.connect(self._on_active_source_changed)
         self.source_view.enabled_changed.connect(self._on_source_enabled_changed)
         self.source_view.settings_changed.connect(self._persist_settings)
+        self.source_view.settings_changed.connect(self._refresh_search_placeholder)
         self.source_view.local_dir_changed.connect(self._on_local_dir_changed)
 
         # ----- stack -----
+        # search_view contains both the search bar AND explore shelves, so
+        # there's no separate explore index. The old idx 5 slot is held by
+        # a hidden placeholder so the existing _switch_view branches that
+        # reference idx 5 keep working — they're rerouted to "home" below.
         self.stack = QStackedWidget()
-        self.stack.addWidget(search_view)            # 0
+        self.stack.addWidget(search_view)            # 0 — home (search + explore)
         self.stack.addWidget(self.library_view)      # 1
         self.stack.addWidget(queue_view)             # 2
         self.stack.addWidget(self.lyrics_view)       # 3
         self.stack.addWidget(self.history_view)      # 4
-        self.stack.addWidget(self.explore_view)      # 5
+        self.stack.addWidget(QWidget())              # 5 — unused placeholder
         self.stack.addWidget(self.album_view)        # 6
         self.stack.addWidget(self.artist_view)       # 7
         self.stack.addWidget(self.visualizer_view)   # 8
@@ -595,7 +622,42 @@ class MainWindow(QMainWindow):
             self.results_cards.clear()
         except Exception:
             pass
+        self._refresh_search_placeholder()
         self.statusBar().showMessage(f"active source: {new_source.name}")
+
+    def _enter_home_mode(self) -> None:
+        """Empty-query home: shelves visible, results hidden."""
+        self._tabs_row_widget.setVisible(False)
+        self.heading.setVisible(False)
+        self.results.setVisible(False)
+        self._results_card_scroll.setVisible(False)
+        self.explore_view.setVisible(True)
+
+    def _enter_results_mode(self) -> None:
+        """Active query: shelves hidden, results area shown."""
+        self.explore_view.setVisible(False)
+        self._tabs_row_widget.setVisible(True)
+        self.heading.setVisible(True)
+        # Default to the list view while loading — _on_results will swap to
+        # the card grid for albums/artists filters.
+        self.results.setVisible(True)
+        self._results_card_scroll.setVisible(False)
+
+    def _on_search_text_changed(self, txt: str) -> None:
+        if not txt.strip():
+            self._enter_home_mode()
+
+    def _refresh_search_placeholder(self) -> None:
+        federated = (
+            getattr(self, "_settings", None) is not None
+            and bool(self._settings.federated_search)
+        )
+        if federated:
+            self.search.setPlaceholderText("search all sources…")
+            return
+        src = getattr(self, "api", None)
+        name = getattr(src, "name", "") or "youtube music"
+        self.search.setPlaceholderText(f"search {name}…")
 
     def _on_source_enabled_changed(self, slug: str, enabled: bool) -> None:
         if slug == "local" and enabled:
@@ -642,9 +704,11 @@ class MainWindow(QMainWindow):
         # Recording the previous root view for the back-stack — never push
         # transient detail pages.
         prev = self.stack.currentIndex()
-        if name == "search":
+        if name in ("home", "search", "explore"):
             self.stack.setCurrentIndex(0)
-            self.search.setFocus()
+            self.explore_view.ensure_loaded()
+            if name == "search":
+                self.search.setFocus()
         elif name == "library":
             self.stack.setCurrentIndex(1)
             if self.library_view.playlists_list.count() == 0:
@@ -657,9 +721,6 @@ class MainWindow(QMainWindow):
         elif name == "history":
             self.stack.setCurrentIndex(4)
             self.history_view.reload()
-        elif name == "explore":
-            self.stack.setCurrentIndex(5)
-            self.explore_view.ensure_loaded()
         elif name == "visualizer":
             self.stack.setCurrentIndex(8)
         elif name == "source":
@@ -687,7 +748,9 @@ class MainWindow(QMainWindow):
     def _on_search(self) -> None:
         q = self.search.text().strip()
         if not q:
+            self._enter_home_mode()
             return
+        self._enter_results_mode()
         self.heading.setText(self._line_heading(f"searching “{q}”"))
         self.results.clear()
         self.results_cards.clear()
@@ -1299,12 +1362,12 @@ class MainWindow(QMainWindow):
     def _wire_shortcuts(self) -> None:
         QShortcut(QKeySequence("Ctrl+L"), self, self.search.setFocus)
         QShortcut(QKeySequence("Ctrl+F"), self, self.search.setFocus)
-        QShortcut(QKeySequence("Ctrl+1"), self, lambda: self._switch_view("search"))
+        QShortcut(QKeySequence("Ctrl+1"), self, lambda: self._switch_view("home"))
         QShortcut(QKeySequence("Ctrl+2"), self, lambda: self._switch_view("library"))
         QShortcut(QKeySequence("Ctrl+3"), self, lambda: self._switch_view("queue"))
         QShortcut(QKeySequence("Ctrl+4"), self, lambda: self._switch_view("lyrics"))
         QShortcut(QKeySequence("Ctrl+5"), self, lambda: self._switch_view("history"))
-        QShortcut(QKeySequence("Ctrl+6"), self, lambda: self._switch_view("explore"))
+        QShortcut(QKeySequence("Ctrl+6"), self, lambda: self._switch_view("home"))
         QShortcut(QKeySequence("Ctrl+7"), self, lambda: self._switch_view("visualizer"))
         QShortcut(QKeySequence("Ctrl+8"), self, lambda: self._switch_view("source"))
         QShortcut(QKeySequence("F11"), self, self._toggle_visualizer_fullscreen)

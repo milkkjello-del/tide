@@ -96,7 +96,8 @@ class ExploreView(QWidget):
                 "youtube music or local files."
             ))
             placeholder.setWordWrap(True)
-            self.shelves_col.addWidget(placeholder)
+            # _content_col holds a stretch at the end; insert before it.
+            self._content_col.insertWidget(self._content_col.count() - 1, placeholder)
             self._loaded = True
             return
         self.heading.setText(_line_heading("explore · loading…"))

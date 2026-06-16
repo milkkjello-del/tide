@@ -55,6 +55,7 @@ class _Activity:
     started_at: float
     paused: bool
     art_url: str = ""
+    source: str = ""
 
 
 class DiscordPresence(QObject):
@@ -182,6 +183,7 @@ class DiscordPresence(QObject):
             started_at=self._track_started_at,
             paused=self._player.state == PlayState.PAUSED,
             art_url=track.thumbnail or "",
+            source=getattr(track, "source", "") or "",
         )
         self._push_current()
 
@@ -242,18 +244,43 @@ class DiscordPresence(QObject):
             played_secs = min(played_secs, duration_secs)
         start_s = now_s - played_secs
         end_s = start_s + duration_secs if duration_secs > 0 else 0
+
+        # Per-source label for large_text / small_text. Some Discord apps
+        # have per-source asset keys uploaded (ytmusic, soundcloud, etc.);
+        # if so we use them, otherwise fall back to "tide". Bare slug as
+        # asset key — Discord ignores unknown keys silently.
+        source_label = {
+            "ytmusic": "youtube music",
+            "soundcloud": "soundcloud",
+            "bandcamp": "bandcamp",
+            "mixcloud": "mixcloud",
+            "local": "local files",
+            "spotify": "spotify",
+            "apple": "apple music",
+        }.get(a.source, "tide")
+
         kwargs: dict = {
             "activity_type": ActivityType.LISTENING,
             "details": details[:128],
             "state": state_text[:128],
-            "large_text": "tide",
+            "large_text": source_label,
             "start": start_s,
-            "small_text": "playing",
+            "small_text": "tide",
         }
         if end_s > 0:
             kwargs["end"] = end_s
         if a.art_url:
             kwargs["large_image"] = a.art_url
+        else:
+            # No per-track art (local files; thumbnails not surfaced). Try
+            # the source-named asset; Discord will silently fall back if
+            # the user's app hasn't uploaded that key.
+            kwargs["large_image"] = a.source or "tide"
+        # Tag the small-image badge with the source slug so Discord apps
+        # that have per-source icons uploaded get them; falls back silently
+        # if absent.
+        if a.source:
+            kwargs["small_image"] = a.source
 
         try:
             self._client.update(**kwargs)
