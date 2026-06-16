@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: discussion
+    url: https://github.com/captiencelovesarch/tide/discussions
+    about: questions, ideas, or "is this a bug?" — open a discussion first

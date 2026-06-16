@@ -6,7 +6,7 @@
 
 **a brutalist multi-source music client**
 
-native Qt6 · 5 sources · 11 themes · 9 visualizers · MPRIS2 · adaptive accent · zero config-file editing
+native Qt6 · 5 sources · 11 themes · 9 visualizers · MPRIS2 · adaptive accent · pitch-shifting speed · zero config-file editing
 
 [![release](https://img.shields.io/github/v/release/captiencelovesarch/tide?style=flat-square&color=d4b95e&labelColor=0b0b0b)](https://github.com/captiencelovesarch/tide/releases/latest)
 [![license](https://img.shields.io/badge/license-GPL--3.0-d4b95e?style=flat-square&labelColor=0b0b0b)](LICENSE)
@@ -30,6 +30,8 @@ git clone https://github.com/captiencelovesarch/tide.git && cd tide && makepkg -
 ```
 
 then launch `tide`, click **`[import]`**, you're listening. that's the whole setup.
+
+> **new in v1.2.0.1** · animations (off / lite / full · track-change scramble + album-art crossfade) · pitch-shifting speed control with popover + presets · UI scale (compact → huge) · adaptive central-area gradient · soft corners option · customizable loading bar · themed nav icons (incl. bundled brutalist SVGs) · 3 bundled fonts + font picker · Discord RP that no longer ticks while songs are still loading · stream-URL prefetch for snappy auto-advance. [full notes →](https://github.com/captiencelovesarch/tide/releases/tag/v1.2.0.1)
 
 ---
 
@@ -113,7 +115,20 @@ queue is source-agnostic. mix a YT Music search, a Bandcamp deep cut, and a loca
 
 - **4 layout presets**: `classic`, `focused`, `dj-deck`, `walkman` (portrait phone-shape) — each swaps widget variants (progress style, volume style, album-art shape, controls size, label arrangement)
 - **adaptive accent** — opt-in toggle that animates the theme accent toward the current cover's dominant color
+- **adaptive central-area gradient** — optional companion to adaptive accent; tints the main content area with a soft vertical gradient pulled from the album palette, retinting per track
 - **per-theme text case** — synthwave renders `H3110 W0R1D`, terminal-green renders `ALL CAPS`, brutalist stays lowercase
+- **3 bundled fonts** — IBM Plex Mono, JetBrains Mono, Inter — plus a font picker that overrides any theme's typography (accepts arbitrary system family names)
+- **themed nav icons** — bundled brutalist SVG line-art (recolored to the active theme's `fg`), classic mono glyphs, or emoji
+
+### motion & feel  *(new in v1.2.0.1)*
+
+- **motion intensity** — `off` / `lite` (default — signature + everyday animations) / `full` (everything including atmospheric). respects `QT_REDUCED_MOTION` and clamps `full` to `lite` when set.
+- **track-change signature** — title decodes left-to-right from random block glyphs while the album art crossfades; layered on top of the existing 1.5s adaptive accent fade for a triple-timeline reveal.
+- **playback speed** — popover with `−0.05` / `+0.05` nudges, preset buttons (`0.5× 0.75× 1.0× 1.25× 1.5× 2.0×`), and a reset. Pitch-shifted by default for the slowed-and-reverb / nightcore vibe; toggle "preserve pitch" in settings for audiobook use. Shortcuts: `[` slow · `]` fast · `\` reset.
+- **UI scale** — `compact (0.85×) / normal / large (1.15×) / huge (1.30×)`. cascades through every fixed-size widget (track row, album art, cards, album/artist pages, view margins).
+- **soft corners** — `sharp` / `soft (6px)` / `rounded (12px)` applies a sticky `@radius` override on inputs, scrollbars, and the central-area clip.
+- **customizable loading bar** — five styles in the status bar tracking the resolve → buffer → playing window: `off`, `numbers`, `blocks`, `dots`, `ascii`.
+- **stream-URL prefetch** — once a track has ≤15s remaining, tide pre-resolves the next one. auto-advance is ~instant on cache hit; silent fallback to normal resolve on miss.
 
 ### audio visualizer (Ctrl+7, F11 for fullscreen)
 
@@ -191,6 +206,8 @@ probably possible, untested, doesn't make sense without MPRIS / kwallet / parec.
 | `Space` | play / pause |
 | `Ctrl+→` / `Ctrl+←` | next / previous track |
 | `Ctrl+↑` / `Ctrl+↓` | volume +/− 5 |
+| `[` / `]` | playback speed −/+ 0.05 |
+| `\` | reset playback speed to 1.0× |
 | `Ctrl+H` | like / unlike current track |
 | `Ctrl+I` | sleep timer dialog |
 | `Ctrl+M` | toggle mini-mode |
@@ -244,6 +261,7 @@ all deps live in Arch's `extra` repo. zero AUR-only python packages. the PKGBUIL
 - [x] **v1.0** — initial release (search, library, playlists, queue, lyrics, MPRIS, 10 themes)
 - [x] **v1.1** — QOL kitchen sink (visualizer, scrobbling, layouts, adaptive accent, tray, history, sleep timer, mini-mode, 11 themes)
 - [x] **v1.2.0** — multi-source: + SoundCloud + Bandcamp + Mixcloud + Local files, source panel, federated search
+- [x] **v1.2.0.1** — pre-spotify glow-up: animations, pitch-shifting speed, UI scale, adaptive central gradient + soft corners, themed nav icons + SVG set, 3 bundled fonts + picker, customizable loading bar, Discord-timer + adaptive-picker fixes, stream-URL prefetch
 - [ ] **v1.2.1** — Spotify (Premium via librespot)
 - [ ] **v1.2.2** — Apple Music (MusicKit JS via embedded webview)
 
