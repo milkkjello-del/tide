@@ -168,6 +168,20 @@ class LibraryView(QWidget):
 
     def reload_playlists(self) -> None:
         self.playlists_list.clear()
+        # If the active source doesn't expose a library, render a clean
+        # empty state instead of spinning a worker that'll just raise.
+        if hasattr(self.api, "supports") and not self.api.supports("library"):
+            src_name = theming.styled_case(getattr(self.api, "name", "this source"))
+            self.index_heading.setText(_line_heading(f"{src_name} has no library"))
+            placeholder = QListWidgetItem(
+                theming.styled_case(
+                    "  switch active source in [source] (Ctrl+8) to one that "
+                    "has a library — youtube music or local files."
+                )
+            )
+            placeholder.setFlags(Qt.NoItemFlags)
+            self.playlists_list.addItem(placeholder)
+            return
         self.index_heading.setText(_line_heading("loading…"))
         thread = QThread(self)
         worker = _PlaylistsWorker(self.api)

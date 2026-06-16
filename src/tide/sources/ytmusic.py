@@ -91,6 +91,10 @@ class YTMusicSource(MusicSource):
     needs_auth = True
     backend_slug = "mpv"
     short_tag = "YT"
+    capabilities = frozenset({
+        "library", "albums", "artists", "videos",
+        "home", "radio", "lyrics", "rating",
+    })
 
     STREAM_TTL_SECONDS = 4 * 3600          # YT CDN URLs last ~6h
 

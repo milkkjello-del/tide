@@ -88,6 +88,17 @@ class ExploreView(QWidget):
     def reload(self) -> None:
         self._loaded = False
         self._clear_content()
+        if hasattr(self.api, "supports") and not self.api.supports("home"):
+            src_name = theming.styled_case(getattr(self.api, "name", "this source"))
+            self.heading.setText(_line_heading(f"explore · not available for {src_name}"))
+            placeholder = QLabel(theming.styled_case(
+                "  switch active source to one that surfaces a home shelf — "
+                "youtube music or local files."
+            ))
+            placeholder.setWordWrap(True)
+            self.shelves_col.addWidget(placeholder)
+            self._loaded = True
+            return
         self.heading.setText(_line_heading("explore · loading…"))
         self.status_message.emit(theming.styled_case("loading explore…"))
 

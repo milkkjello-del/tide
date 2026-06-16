@@ -45,6 +45,7 @@ class BandcampSource(MusicSource):
     needs_auth = False
     backend_slug = "mpv"
     short_tag = "BC"
+    capabilities = frozenset()    # search-only in v1.2.0
 
     # Bandcamp stream URLs don't rotate; keep them forever.
     STREAM_TTL_SECONDS = cache.NEVER_EXPIRES

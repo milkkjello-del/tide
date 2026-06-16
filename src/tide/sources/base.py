@@ -140,6 +140,11 @@ class StreamRef:
 class MusicSource(ABC):
     """Minimum surface every source must implement, plus optional capability
     methods that default to ``NotSupportedError`` so callers can probe.
+
+    ``capabilities`` declares which optional methods are wired. Views check
+    ``source.supports("library")`` (etc.) and render a clean empty state
+    when the active source doesn't expose the feature, instead of catching
+    NotSupportedError after a wasted thread spin.
     """
 
     slug: str = ""
@@ -148,6 +153,14 @@ class MusicSource(ABC):
     needs_auth: bool = False
     backend_slug: str = "mpv"
     short_tag: str = ""        # 2-char badge for federated search rows
+
+    # Known capability keys: "library", "albums", "artists", "videos",
+    # "home", "radio", "lyrics", "rating". Required surface (search_songs +
+    # resolve_stream) is implicit.
+    capabilities: frozenset = frozenset()
+
+    def supports(self, cap: str) -> bool:
+        return cap in self.capabilities
 
     # ---------- auth ----------
 

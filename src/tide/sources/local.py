@@ -231,6 +231,50 @@ class _LocalIndex:
             for r in rows
         ]
 
+    def all_tracks(self, limit: int = 5000) -> list[dict]:
+        with self._lock:
+            conn = self._ensure()
+            cur = conn.execute(
+                "SELECT path, title, artist, album, duration_seconds FROM tracks "
+                "ORDER BY albumartist, album, tracknumber, title LIMIT ?", (limit,))
+            rows = cur.fetchall()
+        return [
+            {"path": r[0], "title": r[1], "artist": r[2], "album": r[3], "duration_seconds": r[4]}
+            for r in rows
+        ]
+
+    def albums(self) -> list[dict]:
+        """List unique (albumartist, album) pairs with track counts."""
+        with self._lock:
+            conn = self._ensure()
+            cur = conn.execute(
+                "SELECT COALESCE(NULLIF(albumartist, ''), artist) AS aa, album, "
+                "COUNT(*) AS n, MAX(year) AS year "
+                "FROM tracks WHERE album != '' "
+                "GROUP BY aa, album ORDER BY aa, album"
+            )
+            rows = cur.fetchall()
+        return [{"albumartist": r[0], "album": r[1], "count": r[2], "year": r[3] or ""} for r in rows]
+
+    def album_tracks(self, albumartist: str, album: str) -> list[dict]:
+        with self._lock:
+            conn = self._ensure()
+            cur = conn.execute(
+                "SELECT path, title, artist, album, duration_seconds, tracknumber "
+                "FROM tracks WHERE album = ? AND "
+                "COALESCE(NULLIF(albumartist, ''), artist) = ? "
+                "ORDER BY tracknumber, title",
+                (album, albumartist),
+            )
+            rows = cur.fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "path": r[0], "title": r[1], "artist": r[2], "album": r[3],
+                "duration_seconds": r[4], "tracknumber": r[5] or "",
+            })
+        return out
+
 
 # ---------- scanning ----------
 
@@ -352,6 +396,7 @@ class LocalSource(MusicSource):
     needs_auth = False
     backend_slug = "mpv"
     short_tag = "LO"
+    capabilities = frozenset({"home", "library", "albums", "artists"})
 
     def __init__(self, music_dir: str | None = None) -> None:
         self._music_dir = music_dir or default_music_dir()
@@ -431,6 +476,63 @@ class LocalSource(MusicSource):
                 track=tr,
             ))
         return [Shelf(title="recently added", items=items)]
+
+    # ---------- library (synthetic) ----------
+
+    def get_library_playlists(self, limit: int = 100) -> list[PlaylistEntry]:
+        """Synthesize one entry per (albumartist, album) pair, plus a global
+        'all tracks' entry pinned to the top.
+
+        ``playlist_id`` is encoded so ``get_playlist`` can decode the album
+        without an extra round-trip.
+        """
+        entries: list[PlaylistEntry] = [
+            PlaylistEntry(
+                playlist_id="local::all",
+                title="all tracks",
+                description=f"{self._index.count():,} files",
+                thumbnail="",
+            ),
+        ]
+        for alb in self._index.albums():
+            aa = alb.get("albumartist") or ""
+            title = alb.get("album") or ""
+            desc = f"{aa} · {alb.get('count', 0)} tracks"
+            if alb.get("year"):
+                desc += f" · {alb['year']}"
+            entries.append(PlaylistEntry(
+                playlist_id=f"local::alb::{aa}::{title}",
+                title=title,
+                description=desc,
+                thumbnail="",
+            ))
+        return entries
+
+    def get_playlist(self, playlist_id: str, limit: int = 1000) -> PlaylistDetail:
+        if playlist_id == "local::all":
+            rows = self._index.all_tracks(limit=limit)
+            return PlaylistDetail(
+                playlist_id=playlist_id,
+                title="all tracks",
+                description=f"{len(rows)} files",
+                track_count=len(rows),
+                tracks=[self._row_to_track(r) for r in rows],
+            )
+        if playlist_id.startswith("local::alb::"):
+            rest = playlist_id[len("local::alb::"):]
+            try:
+                aa, album = rest.split("::", 1)
+            except ValueError:
+                return PlaylistDetail(playlist_id=playlist_id, title="(invalid)")
+            rows = self._index.album_tracks(aa, album)
+            return PlaylistDetail(
+                playlist_id=playlist_id,
+                title=album,
+                description=aa,
+                track_count=len(rows),
+                tracks=[self._row_to_track(r) for r in rows],
+            )
+        return PlaylistDetail(playlist_id=playlist_id, title="(unknown)")
 
     # ---------- helpers ----------
 

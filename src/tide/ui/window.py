@@ -73,11 +73,21 @@ class _SearchWorker(QObject):
 
     def run(self) -> None:
         try:
+            supports = getattr(self.api, "supports", lambda _c: True)
             if self.filter == "albums":
+                if not supports("albums"):
+                    self.done.emit(self.filter, [])
+                    return
                 out = self.api.search_albums(self.query)
             elif self.filter == "artists":
+                if not supports("artists"):
+                    self.done.emit(self.filter, [])
+                    return
                 out = self.api.search_artists(self.query)
             elif self.filter == "videos":
+                if not supports("videos"):
+                    self.done.emit(self.filter, [])
+                    return
                 out = self.api.search_videos(self.query)
             else:
                 out = self.api.search_songs(self.query)
@@ -1018,7 +1028,12 @@ class MainWindow(QMainWindow):
         self.now_label.setStatus("")
         self.statusBar().showMessage("playing")
         self.play_btn.setEnabled(True)
-        self.like_btn.setEnabled(True)
+        # Like only when the track's source supports rating. Same for radio.
+        cur_source = source_registry().get(self._current.source or "ytmusic") if self._current else None
+        can_like = bool(cur_source and cur_source.supports("rating"))
+        can_radio = bool(cur_source and cur_source.supports("radio"))
+        self.like_btn.setEnabled(can_like)
+        self.radio_btn.setEnabled(can_radio)
         # Best-effort like-state lookup in the background; UI defaults to ♡.
         self._liked_current = False
         self._refresh_like_button()

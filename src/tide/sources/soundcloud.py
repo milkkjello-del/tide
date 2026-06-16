@@ -52,6 +52,7 @@ class SoundCloudSource(MusicSource):
     needs_auth = False
     backend_slug = "mpv"
     short_tag = "SC"
+    capabilities = frozenset()    # search-only in v1.2.0
 
     STREAM_TTL_SECONDS = 12 * 3600
 
