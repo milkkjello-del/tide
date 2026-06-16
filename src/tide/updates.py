@@ -17,7 +17,7 @@ from typing import Callable
 from . import config
 
 
-GITHUB_REPO = "milkkjello-del/tide"
+GITHUB_REPO = "captiencelovesarch/tide"
 LATEST_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 CACHE_PATH = config.CACHE_DIR / "update_check.json"
 CHECK_INTERVAL_SECONDS = 24 * 3600

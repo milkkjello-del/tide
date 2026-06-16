@@ -27,7 +27,7 @@ from pathlib import Path
 from . import config
 
 
-USER_AGENT = "tide/1.0 (https://github.com/milkkjello-del/tide)"
+USER_AGENT = "tide/1.0 (https://github.com/captiencelovesarch/tide)"
 LRCLIB_URL = "https://lrclib.net/api/get"
 TIMEOUT_SECONDS = 5.0
 

@@ -8,7 +8,7 @@
 
 native Qt6 · 11 themes · 9 visualizers · MPRIS2 · adaptive accent · zero config-file editing
 
-[![release](https://img.shields.io/github/v/release/milkkjello-del/tide?style=flat-square&color=d4b95e&labelColor=0b0b0b)](https://github.com/milkkjello-del/tide/releases/latest)
+[![release](https://img.shields.io/github/v/release/captiencelovesarch/tide?style=flat-square&color=d4b95e&labelColor=0b0b0b)](https://github.com/captiencelovesarch/tide/releases/latest)
 [![license](https://img.shields.io/badge/license-GPL--3.0-d4b95e?style=flat-square&labelColor=0b0b0b)](LICENSE)
 [![arch](https://img.shields.io/badge/distro-arch_linux-d4b95e?style=flat-square&labelColor=0b0b0b)](https://archlinux.org)
 [![qt6](https://img.shields.io/badge/qt-6-d4b95e?style=flat-square&labelColor=0b0b0b)](https://www.qt.io)
@@ -26,7 +26,7 @@ native Qt6 · 11 themes · 9 visualizers · MPRIS2 · adaptive accent · zero co
 ```
 yay -S tide        # release (when AUR registrations reopen)
 # or right now:
-git clone https://github.com/milkkjello-del/tide.git && cd tide && makepkg -si
+git clone https://github.com/captiencelovesarch/tide.git && cd tide && makepkg -si
 ```
 
 then launch `tide`, click **`[import]`**, you're listening. that's the whole setup.
@@ -128,7 +128,7 @@ in-canvas `⚙` cog overrides renderer + audio source on the fly.
 ### arch linux (everything is in `extra`)
 
 ```sh
-git clone https://github.com/milkkjello-del/tide.git
+git clone https://github.com/captiencelovesarch/tide.git
 cd tide
 makepkg -si
 ```
@@ -148,7 +148,7 @@ not officially supported, but doable:
 ```sh
 sudo apt install python3 mpv libmpv-dev fonts-ibm-plex   # debian/ubuntu equivalent
 pip install --user pyside6 ytmusicapi yt-dlp python-mpv cryptography pypresence numpy sounddevice secretstorage
-git clone https://github.com/milkkjello-del/tide.git
+git clone https://github.com/captiencelovesarch/tide.git
 cd tide && PYTHONPATH=src python -m tide
 ```
 

@@ -227,13 +227,13 @@ class SettingsDialog(QDialog):
         self.repo_btn = QPushButton("github  →")
         self.repo_btn.setFlat(True)
         self.repo_btn.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl("https://github.com/milkkjello-del/tide"))
+            lambda: QDesktopServices.openUrl(QUrl("https://github.com/captiencelovesarch/tide"))
         )
 
         self.issues_btn = QPushButton("report a bug  →")
         self.issues_btn.setFlat(True)
         self.issues_btn.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl("https://github.com/milkkjello-del/tide/issues"))
+            lambda: QDesktopServices.openUrl(QUrl("https://github.com/captiencelovesarch/tide/issues"))
         )
 
         about_links = QHBoxLayout()
