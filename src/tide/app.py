@@ -41,7 +41,13 @@ def ensure_signed_in():
         try:
             return auth.yt_client()
         except Exception:
-            auth.clear_saved_auth()
+            # Building the client makes a network call (visitor-id fetch), so
+            # this can fail transiently even when the saved cookies are fine.
+            # Do NOT delete them here — that used to sign the user out on a
+            # network blip with no way back. Leave the file and fall through
+            # to the import dialog; a later launch with connectivity just
+            # works, and the Sources tab now has an in-app [sign in] button.
+            pass
 
     dlg = SignInDialog()
     if dlg.exec() != dlg.DialogCode.Accepted:

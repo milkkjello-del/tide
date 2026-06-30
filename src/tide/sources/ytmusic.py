@@ -89,6 +89,7 @@ class YTMusicSource(MusicSource):
     name = "youtube music"
     icon = "ytmusic"
     needs_auth = True
+    supports_in_app_auth = True
     backend_slug = "mpv"
     short_tag = "YT"
     capabilities = frozenset({
@@ -100,11 +101,51 @@ class YTMusicSource(MusicSource):
 
     def __init__(self, yt: YTMusic) -> None:
         self.yt = yt
+        self._signed_out = False
 
     # ---------- auth surface ----------
 
     def is_authenticated(self) -> bool:
-        return self.yt is not None
+        return self.yt is not None and not self._signed_out
+
+    def sign_out(self) -> None:
+        """Delete the saved cookie auth and mark this live source signed-out.
+
+        Without this override the Sources-tab sign-out button hit the base
+        no-op, so the cookie file was never removed and the row kept saying
+        "signed in". We delete ``browser.json`` (and the legacy oauth file)
+        so the next launch re-runs the import wizard, and flip a flag so the
+        row reflects the change immediately. The in-memory ``yt`` client is
+        left intact — every browse/search method dereferences it, and the
+        established re-auth UX is "restart to sign back in" — so nulling it
+        would only invite AttributeErrors before the restart. The embedded
+        webview profile is left untouched too, so re-signing-in can harvest
+        fresh cookies from the still-live Google session in one click.
+        """
+        from .. import auth
+        auth.clear_saved_auth()
+        self._signed_out = True
+
+    def begin_auth(self, parent_widget) -> bool:
+        """Run the import wizard and refresh this live source's client so the
+        user can sign back in *without restarting tide* — the recovery path
+        for ``sign_out()``. Returns True iff auth now exists.
+
+        The wizard writes ``browser.json`` itself on success; we just rebuild
+        the YTMusic client from it and clear the signed-out flag so the row
+        flips back to authenticated immediately.
+        """
+        from ..ui.wizard import SignInDialog
+        from .. import auth
+        dlg = SignInDialog(parent_widget)
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return False
+        try:
+            self.yt = auth.yt_client()
+        except Exception:
+            return False
+        self._signed_out = False
+        return True
 
     def status_text(self) -> str:
         return "signed in (cookie import)" if self.is_authenticated() else "sign in via [import]"

@@ -141,6 +141,34 @@ def _substitute(qss: str, theme: Theme) -> str:
     return _TOKEN_RE.sub(repl, qss)
 
 
+def effective_radius_px(theme: "Theme | None") -> int:
+    """The corner radius (px) the QSS ``@radius`` token resolves to for
+    ``theme``.
+
+    Mirrors ``_substitute``'s precedence: a sticky ``radius`` token override
+    (set by the corner-style picker via ``set_user_override``, and merged
+    into ``tokens`` by the manager) wins over the theme's ``[layout]
+    radius_px`` base. Custom-painted widgets that round their own content
+    (e.g. ``AlbumArt``) must consult this rather than ``t('layout',
+    'radius_px')`` directly, or they ignore the user's corner choice and
+    drift out of sync with every QSS-styled widget.
+    """
+    if theme is None:
+        return 0
+    tok = str(theme.token("radius", "")).strip()
+    if tok.endswith("px"):
+        tok = tok[:-2].strip()
+    if tok:
+        try:
+            return max(0, int(float(tok)))
+        except ValueError:
+            pass
+    try:
+        return max(0, int(theme.t("layout", "radius_px", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 # ---------- font registration ----------
 
 

@@ -4,6 +4,18 @@ All notable changes to **tide** land here. Format roughly follows [Keep a Change
 
 The canonical source of truth for the diff lives in the [GitHub Releases](https://github.com/captiencelovesarch/tide/releases) — this file is for browsing history at a glance.
 
+## [1.2.3.1] — 2026-06-30 — bug fixes
+
+Pure bug-fix patch on top of 1.2.3 — no new surface, just things that were quietly wrong. The headline is YouTube Music personalization: the home feed served the generic logged-out shelves and the library came up empty even while signed in.
+
+### Fixed
+- **YouTube Music home is personalized again** — `browser_import` was merging `.google.com` *and* `.youtube.com` cookies into one flat header and deduping by name across domains. The auth cookies (`SID`, `__Secure-3PSID`, `SAPISID`, `__Secure-3PAPISID`) exist on **both** domains with **different** values, so wrong-domain values reached `music.youtube.com` and YouTube treated every request as logged-out (`LOGGED_IN:false`) — search still worked only because it needs no auth, which masked the bug. Now imports only `youtube.com`-scoped cookies, exactly what a browser sends to `music.youtube.com`. Personalized shelves (Quick picks, Listen again, Mixed for you, …) and library are restored.
+- **YouTube Music sign-out actually signs out** — `YTMusicSource` inherited the base no-op `sign_out()`, so the Sources-tab button never cleared the saved cookie and the row kept saying "signed in". It now clears the cookie and flips the row state.
+- **In-app re-sign-in** — the source gear dialog showed no button at all for a signed-out auth source, so signing out stranded YouTube Music until a restart. Added a `[sign in]` button (and `begin_auth()`) that re-runs the import wizard and refreshes the live client in place — no restart.
+- **Auth no longer self-destructs on a network blip** — `ensure_signed_in()` deleted the saved cookies on *any* exception while building the client (which makes a network call), silently signing the user out. Transient failures now leave the saved session intact.
+- **Album art honors rounded corners** — QSS `border-radius` never clips a `QLabel` pixmap, and `AlbumArt` read the theme's base `layout.radius_px` instead of the effective corner-style radius, so the art stayed square inside a rounded border. The pixmap is now masked to `theming.effective_radius_px()`. Sharp themes and the circle/polaroid variants are unchanged.
+- **Settings stop resetting on save** — the settings dialog rebuilt its working copy field-by-field and silently dropped 16 fields (`ui_sounds_enabled`, `sources_enabled`, Spotify/Subsonic credentials, `audio_fx_state`, `first_launch_complete`, …), resetting them to defaults every time you hit save. It now deep-copies the whole settings object.
+
 ## [1.2.3] — 2026-06-16 — ui sounds + crossfading views
 
 Tide gets a sense of touch. Short percussive sounds when switching nav views, soft pops on modal open/close, chirps on checkbox/radio toggles — all six WAVs hand-authored, all ship in `assets/sounds/`. The sounds auto-mute the second music starts playing so they never compete with the audio you're actually listening to. View switches also crossfade now using the same motion helper the onboarding wizard already used. Defaults to **off** on first launch — opt in via Settings → appearance → "ui sounds".

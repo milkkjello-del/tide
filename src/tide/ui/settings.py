@@ -5,6 +5,8 @@ discord settings apply on save.
 """
 from __future__ import annotations
 
+import copy
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtCore import QUrl
@@ -43,31 +45,14 @@ class SettingsDialog(QDialog):
 
         self._initial_theme = current_settings.theme
         self._initial_thumbnails = current_settings.show_thumbnails or "theme"
-        # Copy known fields; defaults handle anything we don't mirror.
-        self._settings = settings_module.Settings(
-            theme=current_settings.theme,
-            discord_enabled=current_settings.discord_enabled,
-            discord_app_id=current_settings.discord_app_id,
-            volume=current_settings.volume,
-            sleep_preset_minutes=current_settings.sleep_preset_minutes,
-            mini_mode_default=current_settings.mini_mode_default,
-            show_thumbnails=current_settings.show_thumbnails or "theme",
-            audio_device=current_settings.audio_device or "",
-            listenbrainz_enabled=current_settings.listenbrainz_enabled,
-            listenbrainz_token=current_settings.listenbrainz_token,
-            layout=current_settings.layout or "classic",
-            layout_overrides=dict(current_settings.layout_overrides or {}),
-            adaptive_accent=current_settings.adaptive_accent,
-            loading_indicator_style=current_settings.loading_indicator_style or "blocks",
-            motion=current_settings.motion or "lite",
-            ui_scale=current_settings.ui_scale or "normal",
-            playback_speed=current_settings.playback_speed or 1.0,
-            preserve_pitch=current_settings.preserve_pitch,
-            adaptive_background=current_settings.adaptive_background,
-            corner_style=current_settings.corner_style or "sharp",
-            nav_icon_set=current_settings.nav_icon_set or "off",
-            font_family_override=current_settings.font_family_override or "",
-        )
+        # Work on a full, independent copy. The dialog mutates only the
+        # fields it surfaces (in _on_save) and persists the whole object, so
+        # any field NOT mirrored here would be written back at its default —
+        # silently wiping sources_enabled, the Spotify/Subsonic credentials,
+        # audio_fx_state, ui_sounds_enabled, first_launch_complete, etc. A
+        # deepcopy preserves every field (including dict fields) verbatim, so
+        # new settings added later can never regress this dialog again.
+        self._settings = copy.deepcopy(current_settings)
 
         self._build_ui()
         self._populate()

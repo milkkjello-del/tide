@@ -252,10 +252,19 @@ def import_cookies(profile: BrowserProfile) -> ImportResult:
             raise ImportError_(f"couldn't open cookies db: {exc}") from exc
 
         try:
+            # ONLY youtube.com-scoped cookies. A browser sends just these to
+            # music.youtube.com — it never sends .google.com cookies there.
+            # Auth cookies (SID, __Secure-3PSID, SAPISID, __Secure-3PAPISID)
+            # exist on BOTH .google.com and .youtube.com with DIFFERENT values;
+            # mixing them into one flat header and deduping by name kept the
+            # wrong-domain value for shared names, so YouTube saw the request
+            # as logged-out (generic home, empty library) even with a fresh,
+            # valid session. Scoping to youtube.com mirrors the real browser
+            # request and authenticates correctly.
             rows = conn.execute(
                 "SELECT host_key, name, value, encrypted_value, expires_utc "
                 "FROM cookies "
-                "WHERE host_key LIKE '%youtube.com' OR host_key LIKE '%google.com' "
+                "WHERE host_key LIKE '%youtube.com' "
                 "ORDER BY expires_utc DESC"
             ).fetchall()
         finally:

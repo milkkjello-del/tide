@@ -168,6 +168,7 @@ class _GenericSourceDialog(QDialog):
     """
 
     sign_out_requested = Signal(str)   # slug
+    sign_in_requested = Signal(str)    # slug
 
     def __init__(self, source, parent=None) -> None:
         super().__init__(parent)
@@ -197,6 +198,13 @@ class _GenericSourceDialog(QDialog):
             signout_btn = QPushButton(styled_case("[sign out]"))
             signout_btn.clicked.connect(self._on_signout)
             col.addWidget(signout_btn)
+        elif source.needs_auth and getattr(source, "supports_in_app_auth", False):
+            # Signed out (or never signed in) but able to re-import in-app.
+            # Without this branch the dialog showed no button at all, so a
+            # sign-out left the source permanently unusable until restart.
+            signin_btn = QPushButton(styled_case("[sign in]"))
+            signin_btn.clicked.connect(self._on_signin)
+            col.addWidget(signin_btn)
         elif not source.needs_auth:
             note = QLabel(styled_case("public catalog — nothing to configure"))
             note.setObjectName("sourceStatus")
@@ -211,6 +219,10 @@ class _GenericSourceDialog(QDialog):
 
     def _on_signout(self) -> None:
         self.sign_out_requested.emit(self._source.slug)
+        self.accept()
+
+    def _on_signin(self) -> None:
+        self.sign_in_requested.emit(self._source.slug)
         self.accept()
 
 
@@ -468,6 +480,7 @@ class SourcePanel(QWidget):
             return
         dlg = _GenericSourceDialog(source, self)
         dlg.sign_out_requested.connect(self._sign_out_source)
+        dlg.sign_in_requested.connect(self._sign_in_source)
         dlg.exec()
 
     def _sign_out_source(self, slug: str) -> None:
@@ -482,6 +495,29 @@ class SourcePanel(QWidget):
         row = self._rows.get(slug)
         if row is not None:
             row.refresh_status()
+            row._refresh_dot(reg.is_enabled(slug))
+
+    def _sign_in_source(self, slug: str) -> None:
+        """Run the source's in-app auth (the import wizard for YT Music) and,
+        on success, re-enable + activate it so it's usable immediately. This
+        is the recovery path that was missing — signing out used to be a
+        one-way trip with no way back in short of restarting tide."""
+        reg = source_registry()
+        source = reg.get(slug)
+        if source is None:
+            return
+        try:
+            ok = bool(source.begin_auth(self))
+        except Exception:
+            ok = False
+        if ok:
+            reg.set_enabled(slug, True)
+            self._settings.sources_enabled[slug] = True
+            self.settings_changed.emit()
+        row = self._rows.get(slug)
+        if row is not None:
+            row.refresh_status()
+            row.set_enabled_state(reg.is_enabled(slug))
             row._refresh_dot(reg.is_enabled(slug))
 
     # ---------- subsonic ----------

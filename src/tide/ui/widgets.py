@@ -7,9 +7,10 @@ tokens and repaint here.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QByteArray, QRect, QSize, Qt, Signal
+from PySide6.QtCore import QByteArray, QRect, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
-    QColor, QFont, QFontMetrics, QIcon, QImage, QPainter, QPen, QPixmap,
+    QColor, QFont, QFontMetrics, QIcon, QImage, QPainter, QPainterPath, QPen,
+    QPixmap,
 )
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QLabel, QPushButton, QSizePolicy, QWidget
@@ -406,6 +407,7 @@ class AlbumArt(QLabel):
         self.setFixedSize(self._size, self._size)
         self.setAlignment(Qt.AlignCenter)
         self._pixmap_raw: QPixmap | None = None
+        self._radius = 0
         self._theme = theming.manager().current()
         self._apply_theme(self._theme)
         theming.manager().theme_changed.connect(self._apply_theme)
@@ -415,7 +417,12 @@ class AlbumArt(QLabel):
         self._theme = theme
         fg = theme.token("fg", "#e6e6e6") if theme else "#e6e6e6"
         bg = theme.token("bg", "#0b0b0b") if theme else "#0b0b0b"
-        radius = int(theme.t("layout", "radius_px", 0)) if theme else 0
+        # Use the *effective* radius (corner-style override or theme base) so
+        # the tile matches every QSS-styled widget. QSS border-radius only
+        # rounds the QLabel's border/background — it never clips the pixmap —
+        # so we also mask the art itself to this radius in _shape().
+        radius = theming.effective_radius_px(theme)
+        self._radius = radius
         # Re-derive scaled size from the base so a ui_scale change picked
         # up via theme_changed resizes the tile.
         from . import scale as _scale
@@ -432,6 +439,33 @@ class AlbumArt(QLabel):
         else:
             self._render(self._pixmap_raw)
 
+    def _shape(self, scaled: QPixmap) -> QPixmap:
+        """Round the art's corners to the active radius so it sits flush
+        inside the rounded border instead of poking square corners through
+        it. No-op when corners are sharp (radius 0) — returns the pixmap
+        untouched so the brutalist look is bit-for-bit unchanged. Subclasses
+        that paint their own shape (circle, polaroid) leave ``_radius`` at 0,
+        so their inherited code paths skip this too.
+        """
+        r = self._radius
+        if r <= 0 or scaled.isNull():
+            return scaled
+        size = self._size
+        out = QPixmap(size, size)
+        out.fill(Qt.transparent)
+        painter = QPainter(out)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, size, size), float(r), float(r))
+        painter.setClipPath(path)
+        # KeepAspectRatioByExpanding can return a pixmap larger than the
+        # tile in one axis; centre it so the crop matches QLabel's own
+        # AlignCenter behaviour before the round.
+        painter.drawPixmap((size - scaled.width()) // 2,
+                           (size - scaled.height()) // 2, scaled)
+        painter.end()
+        return out
+
     def setImage(self, image: QImage | None) -> None:
         from . import motion as motion_module
 
@@ -440,11 +474,11 @@ class AlbumArt(QLabel):
             self._render_empty()
             return
         new_raw = QPixmap.fromImage(image)
-        new_scaled = new_raw.scaled(
+        new_scaled = self._shape(new_raw.scaled(
             self._size, self._size,
             Qt.KeepAspectRatioByExpanding,
             Qt.FastTransformation,
-        )
+        ))
         # Capture what's currently on screen so the crossfade has a "from".
         # Reading from QLabel.pixmap() lets us cross from whatever the user
         # last saw, including a mid-crossfade intermediate frame if the
@@ -463,11 +497,11 @@ class AlbumArt(QLabel):
         )
 
     def _render(self, pix: QPixmap) -> None:
-        scaled = pix.scaled(
+        scaled = self._shape(pix.scaled(
             self._size, self._size,
             Qt.KeepAspectRatioByExpanding,
             Qt.FastTransformation,
-        )
+        ))
         self.setPixmap(scaled)
 
     def _render_empty(self) -> None:

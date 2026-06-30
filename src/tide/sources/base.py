@@ -153,6 +153,11 @@ class MusicSource(ABC):
     needs_auth: bool = False
     backend_slug: str = "mpv"
     short_tag: str = ""        # 2-char badge for federated search rows
+    # True when ``begin_auth()`` is implemented, i.e. the source can sign in
+    # from inside the generic source dialog. Sources with bespoke setup flows
+    # (Spotify OAuth, Subsonic server form) leave this False — they handle
+    # sign-in via their own gear dialogs, not the generic [sign in] button.
+    supports_in_app_auth: bool = False
 
     # Known capability keys: "library", "albums", "artists", "videos",
     # "home", "radio", "lyrics", "rating". Required surface (search_songs +
