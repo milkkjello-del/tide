@@ -39,6 +39,14 @@ if TYPE_CHECKING:
     from .player import Player
     from .queue import Queue
 
+# The rate window we advertise over D-Bus mirrors what the in-app speed UI
+# allows, so external clients can't push tide outside its own range. Guarded
+# import: a UI-module failure must never take the MPRIS service down with it.
+try:
+    from .ui.speed import SPEED_MAX, SPEED_MIN
+except Exception:  # pragma: no cover
+    SPEED_MIN, SPEED_MAX = 0.5, 2.0
+
 
 MPRIS_PATH = "/org/mpris/MediaPlayer2"
 MPRIS_ROOT_IFACE = "org.mpris.MediaPlayer2"
@@ -140,9 +148,10 @@ class _PlayerAdaptor(QDBusAbstractAdaptor):
     def LoopStatus(self) -> str: return "None"
 
     @Property(float)
-    def Rate(self) -> float: return 1.0
+    def Rate(self) -> float: return self._service.rate
     @Rate.setter
-    def Rate(self, _value: float) -> None: pass
+    def Rate(self, value: float) -> None:
+        self._service.on_set_rate(value)
 
     @Property(bool)
     def Shuffle(self) -> bool: return False
@@ -153,7 +162,7 @@ class _PlayerAdaptor(QDBusAbstractAdaptor):
     def Metadata(self) -> dict: return self._service.metadata
 
     @Property(float)
-    def Volume(self) -> float: return 1.0
+    def Volume(self) -> float: return self._service.volume
     @Volume.setter
     def Volume(self, value: float) -> None:
         self._service.on_set_volume(value)
@@ -162,10 +171,10 @@ class _PlayerAdaptor(QDBusAbstractAdaptor):
     def Position(self) -> int: return self._service.position_us
 
     @Property(float)
-    def MinimumRate(self) -> float: return 1.0
+    def MinimumRate(self) -> float: return SPEED_MIN
 
     @Property(float)
-    def MaximumRate(self) -> float: return 1.0
+    def MaximumRate(self) -> float: return SPEED_MAX
 
     @Property(bool)
     def CanGoNext(self) -> bool: return self._service.can_go_next
@@ -213,6 +222,9 @@ class MprisService(QObject):
         self._duration_us: int = 0
         self._position_us: int = 0
         self._playback_status: str = "Stopped"
+        # The window's volume widget we're currently hooked to (it can be
+        # swapped at runtime when the user changes layout slots).
+        self._volume_widget = None
 
         self._root = _RootAdaptor(self)
         self._player_adaptor = _PlayerAdaptor(self)
@@ -263,6 +275,8 @@ class MprisService(QObject):
         self._player.state_changed.connect(self._on_state_changed)
         self._player.position_changed.connect(self._on_position_changed)
         self._player.duration_changed.connect(self._on_duration_changed)
+        self._player.speed_changed.connect(self._on_speed_changed)
+        self._hook_volume_widget()
         self._queue.current_changed.connect(self._on_current_changed)
         self._queue.rowsInserted.connect(self._on_queue_changed)
         self._queue.rowsRemoved.connect(self._on_queue_changed)
@@ -271,6 +285,26 @@ class MprisService(QObject):
     def _refresh_all(self) -> None:
         self._on_current_changed(self._queue.current)
         self._on_state_changed(self._player.state)
+
+    def _hook_volume_widget(self) -> None:
+        """Listen to the window's volume widget so external MPRIS clients
+        see slider moves live. The router has no volume-changed signal of
+        its own, and the widget is rebuilt on layout swaps — so we re-hook
+        via ``destroyed`` (by the time it fires, ``window.volume`` already
+        points at the replacement)."""
+        widget = getattr(self._window, "volume", None)
+        if widget is None or widget is self._volume_widget:
+            return
+        try:
+            widget.volume_changed.connect(self._on_app_volume_changed)
+            widget.destroyed.connect(self._on_volume_widget_destroyed)
+        except (AttributeError, RuntimeError, TypeError):
+            return
+        self._volume_widget = widget
+
+    def _on_volume_widget_destroyed(self, *_args) -> None:
+        self._volume_widget = None
+        self._hook_volume_widget()
 
     # ---------- state accessors used by adaptors ----------
 
@@ -293,6 +327,30 @@ class MprisService(QObject):
     @property
     def position_us(self) -> int:
         return self._position_us
+
+    @property
+    def volume(self) -> float:
+        """Live app volume as the MPRIS 0.0–1.0 float. The PlaybackRouter
+        keeps the authoritative 0–100 int but exposes no public getter, so
+        we read its private cache; fall back to the window's slider."""
+        vol = getattr(self._player, "_volume", None)
+        if vol is None:
+            try:
+                vol = self._window.volume.volume()
+            except (AttributeError, RuntimeError):
+                return 1.0
+        try:
+            return max(0.0, min(1.0, float(vol) / 100.0))
+        except (TypeError, ValueError):
+            return 1.0
+
+    @property
+    def rate(self) -> float:
+        """Live playback rate (1.0 = normal) from the player/router."""
+        try:
+            return float(getattr(self._player, "speed", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            return 1.0
 
     @property
     def metadata(self) -> dict:
@@ -336,6 +394,12 @@ class MprisService(QObject):
         # Position is *not* emitted on PropertiesChanged per spec — clients
         # poll it. We do emit Seeked on jumps which are handled in on_seek_*.
 
+    def _on_speed_changed(self, rate: float) -> None:
+        self._emit_props_changed({"Rate": float(rate)})
+
+    def _on_app_volume_changed(self, percent: int) -> None:
+        self._emit_props_changed({"Volume": max(0.0, min(1.0, percent / 100.0))})
+
     def _on_duration_changed(self, secs: float) -> None:
         new_dur = int(secs * 1_000_000)
         if new_dur != self._duration_us:
@@ -349,7 +413,11 @@ class MprisService(QObject):
         self._duration_us = 0
         self._current_track = track
         self._position_us = 0
-        # Many things move at once when the track flips.
+        # Many things move at once when the track flips. Volume/Rate are
+        # rebroadcast too: the startup push of persisted volume/speed goes
+        # through paths with no signal (``apply_initial_volume`` sets the
+        # slider with emit=False), so the first track change is the earliest
+        # reliable moment to correct clients that cached our defaults.
         changes = {
             "Metadata": self.metadata,
             "CanPlay": self.has_track,
@@ -357,6 +425,8 @@ class MprisService(QObject):
             "CanSeek": self.has_track,
             "CanGoNext": self.can_go_next,
             "CanGoPrevious": self.can_go_previous,
+            "Volume": self.volume,
+            "Rate": self.rate,
         }
         self._emit_props_changed(changes)
         # Also signal that the position got reset, since position_us silently
@@ -408,7 +478,45 @@ class MprisService(QObject):
         self._emit_seeked(int(position_secs * 1_000_000))
 
     def on_set_volume(self, value: float) -> None:
-        self._player.set_volume(int(max(0.0, min(1.0, value)) * 100))
+        percent = int(round(max(0.0, min(1.0, value)) * 100))
+        self._player.set_volume(percent)
+        # Keep tide's own slider in step (display-only; emit=False avoids a
+        # feedback loop through the widget hook and the window's persist
+        # handler — KDE sends a burst of sets while dragging).
+        try:
+            self._window.volume.setVolume(percent, emit=False)
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        # Confirm the accepted value so clients don't snap their slider back.
+        self._emit_props_changed({"Volume": percent / 100.0})
+
+    def on_set_rate(self, value: float) -> None:
+        """MPRIS clients writing the Rate property. Per spec a rate of 0.0
+        must act as Pause, never be stored; out-of-range values are clamped
+        to the UI's supported window. Route through the window's SpeedButton
+        when available — it is the authoritative speed store (display +
+        settings persistence) — falling back to the raw player."""
+        try:
+            rate = float(value)
+        except (TypeError, ValueError):
+            return
+        if rate <= 0.0:
+            self._player.pause()
+            return
+        rate = max(SPEED_MIN, min(SPEED_MAX, rate))
+        applied = False
+        btn = getattr(self._window, "speed_btn", None)
+        if btn is not None:
+            try:
+                btn.set_speed(rate)
+                applied = True
+            except (AttributeError, RuntimeError):
+                pass
+        if not applied:
+            self._player.set_speed(rate)
+        # Confirm the effective (clamped/snapped) rate; harmless duplicate
+        # of the speed_changed hook when the value actually moved.
+        self._emit_props_changed({"Rate": self.rate})
 
     def raise_window(self) -> None:
         try:

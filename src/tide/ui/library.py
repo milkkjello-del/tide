@@ -45,19 +45,20 @@ class _PlaylistsWorker(QObject):
 
 
 class _PlaylistDetailWorker(QObject):
-    done = Signal(object)
-    failed = Signal(str)
+    done = Signal(int, object)      # request gen, PlaylistDetail
+    failed = Signal(int, str)       # request gen, error
 
-    def __init__(self, api_obj: api.Api, playlist_id: str) -> None:
+    def __init__(self, api_obj: api.Api, playlist_id: str, gen: int) -> None:
         super().__init__()
         self.api = api_obj
         self.playlist_id = playlist_id
+        self.gen = gen
 
     def run(self) -> None:
         try:
-            self.done.emit(self.api.get_playlist(self.playlist_id))
+            self.done.emit(self.gen, self.api.get_playlist(self.playlist_id))
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(self.gen, str(exc))
 
 
 def _line_heading(label: str, total: int = 60) -> str:
@@ -84,6 +85,9 @@ class LibraryView(QWidget):
         self._pls_worker: _PlaylistsWorker | None = None
         self._detail_thread: QThread | None = None
         self._detail_worker: _PlaylistDetailWorker | None = None
+        # Monotonic id for detail requests: a slow fetch for playlist A must
+        # not repaint the pane after the user has already opened playlist B.
+        self._detail_gen = 0
 
         self._current_detail: api.PlaylistDetail | None = None
 
@@ -223,13 +227,14 @@ class LibraryView(QWidget):
     # ---------- detail ----------
 
     def open_playlist(self, entry: api.PlaylistEntry) -> None:
+        self._detail_gen += 1
         self.tracks_list.clear()
         self.detail_heading.setText(_line_heading(f"{entry.title} · loading…"))
         self.stack.setCurrentIndex(1)
         self.status_message.emit(theming.styled_case(f"loading {entry.title}…"))
 
         thread = QThread(self)
-        worker = _PlaylistDetailWorker(self.api, entry.playlist_id)
+        worker = _PlaylistDetailWorker(self.api, entry.playlist_id, self._detail_gen)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.done.connect(self._on_detail)
@@ -242,7 +247,9 @@ class LibraryView(QWidget):
         self._detail_worker = worker
         thread.start()
 
-    def _on_detail(self, detail: api.PlaylistDetail) -> None:
+    def _on_detail(self, gen: int, detail: api.PlaylistDetail) -> None:
+        if gen != self._detail_gen:
+            return   # straggler for a playlist the user already left
         self._current_detail = detail
         marker = self._list_marker()
         self.detail_heading.setText(_line_heading(f"{detail.title} · {len(detail.tracks)}"))
@@ -260,11 +267,16 @@ class LibraryView(QWidget):
             self.tracks_list.addItem(item)
         self.status_message.emit(theming.styled_case(f"{detail.title} · {len(detail.tracks)} tracks"))
 
-    def _on_detail_failed(self, msg: str) -> None:
+    def _on_detail_failed(self, gen: int, msg: str) -> None:
+        if gen != self._detail_gen:
+            return
         self.detail_heading.setText(_line_heading("playlist load failed"))
         self.status_message.emit(f"playlist: {msg}")
 
     def _show_index(self) -> None:
+        # Back to the index invalidates any fetch still in flight, so it
+        # can't repaint the (now hidden) detail pane or spam the status bar.
+        self._detail_gen += 1
         self.stack.setCurrentIndex(0)
 
     # ---------- track interactions ----------

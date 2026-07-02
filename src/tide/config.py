@@ -32,7 +32,15 @@ HISTORY_FILE: Path = CACHE_DIR / "history.jsonl"
 def ensure_dirs() -> None:
     for d in (CONFIG_DIR, CACHE_DIR, DATA_DIR, ART_CACHE_DIR, LYRICS_CACHE_DIR, USER_THEMES_DIR, WEBVIEW_PROFILE_DIR):
         d.mkdir(parents=True, exist_ok=True)
-    try:
-        CONFIG_DIR.chmod(0o700)
-    except OSError:
-        pass
+    # Tighten the three top-level state roots to owner-only. CONFIG_DIR holds
+    # tokens/passwords; CACHE_DIR and DATA_DIR are just as sensitive — the
+    # librespot subprocess writes a reusable Spotify credential file under
+    # CACHE_DIR at its own 0644, and a co-user on a distro with 0755 home
+    # dirs could read it through a world-traversable cache tree. Hardening
+    # the directory boundary (not just per-file modes) closes that whether or
+    # not every writer remembers to chmod its own files.
+    for d in (CONFIG_DIR, CACHE_DIR, DATA_DIR):
+        try:
+            d.chmod(0o700)
+        except OSError:
+            pass

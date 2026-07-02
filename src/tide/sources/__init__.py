@@ -29,6 +29,11 @@ class SourceRegistry(QObject):
 
     active_changed = Signal(str)            # new active slug
     enabled_changed = Signal(str, bool)     # slug, enabled
+    # A source's *saved* session stopped authenticating (e.g. the imported
+    # YT Music cookies expired). Emitted via notify_auth_expired(), usually
+    # from the worker thread that hit the failure — receivers living in the
+    # GUI thread get a queued delivery, so it's safe to raise UI from a slot.
+    auth_expired = Signal(str)              # slug
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -78,6 +83,15 @@ class SourceRegistry(QObject):
         self._enabled.setdefault(slug, True)
         self._enabled[slug] = True
         self.active_changed.emit(slug)
+
+    def notify_auth_expired(self, slug: str) -> None:
+        """Report that ``slug``'s stored credentials no longer authenticate.
+
+        Sources call this from whatever thread the failing request ran on;
+        cross-thread delivery is the signal's job, not the caller's.
+        """
+        if slug in self._sources:
+            self.auth_expired.emit(slug)
 
 
 _registry: SourceRegistry | None = None

@@ -6,6 +6,8 @@ the user to hand-edit this file.
 """
 from __future__ import annotations
 
+import os
+import tempfile
 import tomllib
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -18,6 +20,10 @@ class Settings:
     theme: str = "brutalist-mono"
     discord_enabled: bool = False
     discord_app_id: str = ""
+    # Show the live synced-lyric line in the presence "state" field
+    # (replaces artist · album while a line is active). Off by default —
+    # lyrics get broadcast to everyone who can see the profile.
+    discord_lyrics_enabled: bool = False
     volume: int = 80
     sleep_preset_minutes: int = 30
     mini_mode_default: bool = False
@@ -41,9 +47,15 @@ class Settings:
     # If True, mpv's scaletempo filter keeps pitch steady when speed changes.
     # Default off so the tide aesthetic is the slowed/sped-with-pitch one.
     preserve_pitch: bool = False
-    # When True (and adaptive_accent is also on), the central content area
-    # paints a vertical gradient from theme.bg → adaptive-derived bg_alt.
+    # When True, the main app surface paints an album-palette backdrop (see
+    # ui/central_bg.py).
     adaptive_background: bool = False
+    # Adaptive backdrop style: "field" | "band" | "vbeam".
+    adaptive_background_style: str = "field"
+    # When True (and adaptive_background is on), that gradient also swells /
+    # brightens on heavy bass, app-wide while playing. Needs the monitor
+    # capture running, so it costs a little constant CPU during playback.
+    adaptive_pulse: bool = False
     # Corner softness: "sharp" (0px), "soft" (6px), "rounded" (12px). Applied
     # via a persistent radius override on the theming manager so it doesn't
     # get cleared when the adaptive driver clears its dynamic overrides.
@@ -133,19 +145,77 @@ def _to_toml(s: Settings) -> str:
     return "\n".join(out) + "\n" + "\n".join(tables) + ("\n" if tables else "")
 
 
-def load() -> Settings:
-    path = config.SETTINGS_FILE
-    if not path.is_file():
-        # First-ever launch — wizard will run.
-        return Settings()
+def _backup_path(path: Path) -> Path:
+    # `settings.toml` -> `settings.toml.bak` (with_suffix would eat `.toml`).
+    return path.with_name(path.name + ".bak")
+
+
+def _atomic_write(path: Path, data: str, *, fsync: bool = True) -> None:
+    """Write ``data`` to ``path`` via a unique same-directory temp file so a
+    crash/power-loss mid-write can never leave a truncated target. The temp
+    is fsync'd (when asked) before the rename and always 0o600 — settings
+    can hold the subsonic password and the ListenBrainz token."""
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+            f.flush()
+            if fsync:
+                os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)  # mkstemp default, but be explicit
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _try_parse(path: Path) -> dict | None:
+    """Parse a TOML file; None if missing/unreadable/corrupt. A zero-key
+    result (empty file — the classic power-loss artifact) counts as corrupt:
+    ``save()`` always writes every field, so a legit file is never empty."""
     try:
         with open(path, "rb") as f:
             raw = tomllib.load(f)
     except Exception:
-        return Settings()
+        return None
+    return raw or None
+
+
+def load() -> Settings:
+    path = config.SETTINGS_FILE
+    bak = _backup_path(path)
+    raw = _try_parse(path)
+    if raw is not None:
+        # Tighten perms on files written by older versions, and refresh the
+        # last-known-good backup with what we just parsed successfully.
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        try:
+            _atomic_write(bak, path.read_text(encoding="utf-8"), fsync=False)
+        except Exception:
+            pass
+    else:
+        raw = _try_parse(bak)
+        if raw is None:
+            # True first-ever launch (or both copies unreadable) — wizard runs.
+            return Settings()
+        # Main file is missing/corrupt but the backup parses: use it, and
+        # heal the main file so nothing depends on the .bak sticking around.
+        try:
+            _atomic_write(path, bak.read_text(encoding="utf-8"))
+        except Exception:
+            pass
     known = {f.name for f in fields(Settings)}
     filtered = {k: v for k, v in raw.items() if k in known}
-    # If the settings file exists at all, the user is past first launch —
+    # If a settings file exists at all, the user is past first launch —
     # the file only gets written by `save()` which only runs after the
     # wizard, in-app settings dialog, etc. Auto-stamp existing configs so
     # users upgrading from pre-wizard versions don't get re-onboarded.
@@ -156,7 +226,14 @@ def load() -> Settings:
 def save(s: Settings) -> None:
     path = config.SETTINGS_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(_to_toml(s))
-    tmp.replace(path)
+    payload = _to_toml(s)
+    _atomic_write(path, payload)
+    # Mirror the freshly-committed content into the backup. Writing the
+    # payload (rather than rotating the old file) guarantees the .bak is
+    # always parseable — rotating could immortalize an already-corrupt
+    # main file. Best-effort and un-fsync'd: if it tears, the next
+    # successful load() rewrites it from the good main file.
+    try:
+        _atomic_write(_backup_path(path), payload, fsync=False)
+    except Exception:
+        pass

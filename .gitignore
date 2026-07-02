@@ -10,6 +10,10 @@ dist/
 *.swp
 .DS_Store
 
+# Dev-run shim (repo-root symlink to src/tide so `python -m unittest`/`python -m tide`
+# run from the checkout import the working tree instead of the installed package)
+/tide
+
 # AUR build artifacts (makepkg pkg/ and extracted source dirs, not src/tide/)
 /pkg/
 /tide-*/

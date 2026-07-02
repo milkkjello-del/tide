@@ -19,6 +19,8 @@ fires, instead of binding a closure per cell.
 from __future__ import annotations
 
 import hashlib
+import os
+import tempfile
 from collections import OrderedDict
 from pathlib import Path
 from typing import Callable
@@ -31,6 +33,34 @@ from .. import config
 
 
 MEM_LRU_LIMIT = 256
+
+# Thumbnail URLs come straight from third-party server JSON (Subsonic
+# coverArt, Bandcamp/SoundCloud/YT thumbnails), so a malicious or MITM'd
+# source controls the string. QNetworkAccessManager natively speaks
+# file://, data://, ftp://, qrc:// — so an unchecked URL is a local-file
+# read / blind-SSRF primitive. Only http(s) may be fetched.
+_ALLOWED_ART_SCHEMES = frozenset({"http", "https"})
+
+# Hard ceiling on a single art download. Album art is tens of KB; anything
+# past a couple MB is either hostile (memory/disk-fill DoS) or not art.
+# Enforced live via downloadProgress so we abort mid-stream, not after
+# buffering the whole body.
+MAX_ART_BYTES = 8 * 1024 * 1024
+
+# Abort a fetch that stalls or never completes (Qt has no default timeout
+# on this path, unlike the urllib surface).
+ART_TRANSFER_TIMEOUT_MS = 15_000
+
+
+def _is_fetchable_art_url(url: str) -> bool:
+    """True only for http/https URLs with a host. Blocks file://, data:,
+    ftp://, and scheme-relative/garbage strings before they reach QNAM."""
+    if not url:
+        return False
+    qurl = QUrl(url)
+    if not qurl.isValid():
+        return False
+    return qurl.scheme().lower() in _ALLOWED_ART_SCHEMES and bool(qurl.host())
 
 
 def _hash(url: str) -> str:
@@ -123,16 +153,44 @@ class _ArtCache(QObject):
         path = _disk_path(url)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(raw)
+            # Write via a unique temp + atomic replace rather than opening the
+            # deterministic sha1 target directly: if someone pre-plants a
+            # symlink at that name, write_bytes would follow it and clobber an
+            # arbitrary file. mkstemp creates a fresh 0600 regular file, and
+            # os.replace onto the final name never traverses a symlink target.
+            fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".art.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(raw)
+                os.replace(tmp_name, path)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
         except OSError:
             pass
 
     def _fetch(self, url: str) -> None:
         if url in self._inflight:
             return
+        # Reject non-http(s) before touching the network stack — a
+        # file:///… or data: "thumbnail" from a hostile source must never
+        # reach QNAM. Report a miss so callers drop the placeholder.
+        if not _is_fetchable_art_url(url):
+            self._fire_callbacks(url, None)
+            return
         self._inflight.add(url)
         req = QNetworkRequest(QUrl(url))
+        req.setTransferTimeout(ART_TRANSFER_TIMEOUT_MS)
         reply = self._net.get(req)
+
+        def on_progress(received: int, _total: int) -> None:
+            # Kill an oversized body mid-stream so a multi-GB / slow-loris
+            # response can't grow client memory unbounded.
+            if received > MAX_ART_BYTES:
+                reply.abort()
 
         def on_finished():
             try:
@@ -148,6 +206,11 @@ class _ArtCache(QObject):
             data = bytes(reply.readAll().data())
             reply.deleteLater()
             self._inflight.discard(url)
+            # Belt-and-suspenders: also drop anything that slipped past the
+            # progress guard (e.g. a body delivered in one chunk).
+            if len(data) > MAX_ART_BYTES:
+                self._fire_callbacks(url, None)
+                return
             img = QImage()
             if not img.loadFromData(data):
                 self._fire_callbacks(url, None)
@@ -157,6 +220,7 @@ class _ArtCache(QObject):
             self.image_loaded.emit(url, img)
             self._fire_callbacks(url, img)
 
+        reply.downloadProgress.connect(on_progress)
         reply.finished.connect(on_finished)
 
     def _fire_callbacks(self, url: str, img: QImage | None) -> None:

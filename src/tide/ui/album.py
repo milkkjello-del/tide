@@ -118,6 +118,14 @@ class AlbumView(QWidget):
         self.description_label.setWordWrap(True)
         self.description_label.setMaximumHeight(96)
 
+        # These carry remote metadata (album title, artist, description from
+        # the source server). QLabel defaults to AutoText, which renders
+        # anything that looks like markup as HTML — so a crafted title/
+        # description could inject rich text or a file:// image probe. Force
+        # PlainText so remote strings are always shown literally.
+        for _lbl in (self.title_label, self.artist_label, self.meta_label, self.description_label):
+            _lbl.setTextFormat(Qt.PlainText)
+
         meta_col = QVBoxLayout()
         meta_col.setContentsMargins(0, 0, 0, 0)
         meta_col.setSpacing(4)

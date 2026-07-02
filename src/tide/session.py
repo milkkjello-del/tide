@@ -14,6 +14,8 @@ Restored on:
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -64,20 +66,33 @@ def _track_from_dict(d: dict) -> Track:
 
 
 def save(snapshot: Snapshot) -> None:
-    """Write atomically. Failures swallowed — losing session is not fatal."""
+    """Write atomically. Failures swallowed — losing session is not fatal.
+
+    Unique temp file + fsync + rename so a crash mid-save can't truncate
+    the previous snapshot, and 0o600 throughout — subsonic thumbnail URLs
+    in the snapshot can embed credentials.
+    """
     path = config.SESSION_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     snapshot.saved_at = time.time()
-    tmp = path.with_suffix(".tmp")
+    tmp: Path | None = None
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+        )
+        tmp = Path(tmp_name)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            os.fchmod(f.fileno(), 0o600)  # mkstemp default, but be explicit
             json.dump(asdict(snapshot), f)
-        tmp.replace(path)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
     except OSError:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def load() -> Snapshot | None:

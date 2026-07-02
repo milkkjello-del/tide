@@ -30,6 +30,7 @@ import secrets
 import socket
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -283,6 +284,18 @@ class AuthFlow:
     verifier: str = ""
     state: str = ""
     redirect_uri: str = field(default="", init=False)
+    _cancelled: bool = field(default=False, init=False, repr=False)
+    _pending: _CallbackResult | None = field(default=None, init=False, repr=False)
+
+    def cancel(self) -> None:
+        """Unblock a pending ``run_callback()`` promptly. Thread-safe: the
+        GUI thread calls this when the sign-in dialog closes; the blocked
+        worker-thread call wakes up, shuts the loopback server down, and
+        raises RuntimeError instead of sitting out the full timeout."""
+        self._cancelled = True
+        pending = self._pending
+        if pending is not None:
+            pending.event.set()
 
     def authorize_url(self) -> str:
         self.port = self.port or _free_port()
@@ -303,22 +316,31 @@ class AuthFlow:
 
     def run_callback(self, timeout_seconds: float = 180.0) -> str:
         """Block until the user completes the browser flow. Returns the
-        authorization code or raises RuntimeError on timeout/error."""
+        authorization code or raises RuntimeError on timeout, error, or
+        ``cancel()``."""
         if not self.port:
             raise RuntimeError("call authorize_url() first")
         result = _CallbackResult()
+        self._pending = result
+        if self._cancelled:
+            # cancel() raced us before the wait started — bail before
+            # even binding the server.
+            raise RuntimeError("sign-in cancelled")
         server = http.server.HTTPServer(
             (CALLBACK_HOST, self.port),
             _make_handler(self.state, result),
         )
-        # Serve until the callback fires or the user cancels (which
-        # external callers signal by raising shutdown_server()).
+        # Serve until the callback fires, the timeout lapses, or an
+        # external caller (the sign-in dialog closing) calls cancel(),
+        # which sets the shared event to wake us early.
         t = threading.Thread(target=server.serve_forever, daemon=True)
         t.start()
         ok = result.event.wait(timeout=timeout_seconds)
         server.shutdown()
         server.server_close()
         t.join(timeout=1.0)
+        if self._cancelled:
+            raise RuntimeError("sign-in cancelled")
         if not ok:
             raise RuntimeError("timed out waiting for spotify authorization")
         if result.error:
@@ -380,22 +402,25 @@ def refresh_tokens(tokens: SpotifyTokens) -> SpotifyTokens:
     )
 
 
-def ensure_fresh(tokens: SpotifyTokens) -> SpotifyTokens:
-    if not tokens.is_expired():
-        return tokens
-    refreshed = refresh_tokens(tokens)
-    save_tokens(refreshed)
-    return refreshed
-
-
 # ---------- module-level token cache ----------
 #
 # A single in-memory cache so SpotifySource and LibrespotBackend share a
 # view of the current tokens. Both call ``current_access_token()`` (which
 # refreshes if needed) without having to plumb mutable state through
 # every constructor.
+#
+# All refreshing runs under one lock: Spotify ROTATES the refresh token on
+# every use, so two threads refreshing concurrently with the same stored
+# token means the loser presents an already-burned token and gets
+# ``invalid_grant`` — which can invalidate the whole grant chain and force
+# the user back through the browser flow for no reason.
 
 _cached: SpotifyTokens | None = None
+_refresh_lock = threading.Lock()
+_refresh_dead = False           # invalid_grant seen — re-sign-in required
+_refresh_backoff_until = 0.0    # don't re-attempt before this (network woes)
+
+_NETWORK_BACKOFF_SECONDS = 30.0
 
 
 def _ensure_loaded() -> SpotifyTokens | None:
@@ -403,6 +428,14 @@ def _ensure_loaded() -> SpotifyTokens | None:
     if _cached is None:
         _cached = load_tokens()
     return _cached
+
+
+def saved_tokens() -> SpotifyTokens | None:
+    """The stored tokens as-is — possibly expired, but NO network. Boot
+    uses this to decide whether to register the Spotify source without
+    blocking the GUI thread on a token refresh (and without dropping the
+    source entirely when the machine is offline)."""
+    return _ensure_loaded()
 
 
 def current_tokens() -> SpotifyTokens | None:
@@ -415,17 +448,61 @@ def current_tokens() -> SpotifyTokens | None:
 
 
 def refresh_and_persist() -> SpotifyTokens | None:
-    global _cached
-    t = _ensure_loaded()
-    if t is None:
-        return None
+    global _cached, _refresh_dead, _refresh_backoff_until
+    with _refresh_lock:
+        t = _ensure_loaded()
+        if t is None or not t.refresh_token:
+            return None
+        # Someone else may have refreshed while we waited on the lock; if
+        # so their result is fresh and re-refreshing would burn a rotated
+        # token. Same lock also serializes the save.
+        if not t.is_expired():
+            return t
+        if _refresh_dead:
+            return None            # token is revoked; only sign-in resets
+        if time.time() < _refresh_backoff_until:
+            return None            # offline recently — don't hammer
+        try:
+            new = refresh_tokens(t)
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            if exc.code in (400, 401) and "invalid_grant" in body:
+                # Definitive: the refresh token is revoked or expired.
+                # Retrying can never succeed — flag it and tell the UI
+                # (once) so the user gets the sign-in toast instead of a
+                # session that silently 401s forever.
+                _refresh_dead = True
+                _notify_auth_expired()
+            else:
+                _refresh_backoff_until = time.time() + _NETWORK_BACKOFF_SECONDS
+            return None
+        except (urllib.error.URLError, OSError, ValueError):
+            # Transient/network — keep the stored token and back off.
+            _refresh_backoff_until = time.time() + _NETWORK_BACKOFF_SECONDS
+            return None
+        save_tokens(new)
+        _cached = new
+        _refresh_backoff_until = 0.0
+        return new
+
+
+def auth_is_dead() -> bool:
+    """True when a refresh came back ``invalid_grant`` — the UI shows
+    "session expired" instead of pretending we're signed in."""
+    return _refresh_dead
+
+
+def _notify_auth_expired() -> None:
+    # Late import: sources package imports this module.
     try:
-        new = refresh_tokens(t)
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
-        return None
-    save_tokens(new)
-    _cached = new
-    return new
+        from .sources import registry
+        registry().notify_auth_expired("spotify")
+    except Exception:
+        pass
 
 
 def current_access_token() -> str:
@@ -436,13 +513,17 @@ def current_access_token() -> str:
 def set_cached(tokens: SpotifyTokens) -> None:
     """Called after a successful sign-in to seed the cache without a
     disk round-trip."""
-    global _cached
+    global _cached, _refresh_dead, _refresh_backoff_until
     _cached = tokens
+    _refresh_dead = False
+    _refresh_backoff_until = 0.0
 
 
 def clear_cached() -> None:
-    global _cached
+    global _cached, _refresh_dead, _refresh_backoff_until
     _cached = None
+    _refresh_dead = False
+    _refresh_backoff_until = 0.0
     clear_saved_auth()
 
 

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import copy
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
@@ -111,6 +111,19 @@ class SettingsDialog(QDialog):
         self.adaptive_bg_toggle = QCheckBox(
             "tint central area with album-derived gradient"
         )
+        self.adaptive_style_picker = QComboBox()
+        self.adaptive_style_picker.addItem("living fields · layered ambience", "field")
+        self.adaptive_style_picker.addItem("diagonal band · classic sweep", "band")
+        self.adaptive_style_picker.addItem("bass arch · hill swells on bass", "vbeam")
+
+        # Bass pulse — swells / brightens that gradient on heavy bass while
+        # playing. Needs the monitor capture, so it's gated on the gradient
+        # being on and costs a little constant CPU during playback.
+        self.adaptive_pulse_toggle = QCheckBox(
+            "pulse the gradient on heavy bass"
+        )
+        self.adaptive_bg_toggle.toggled.connect(self.adaptive_pulse_toggle.setEnabled)
+        self.adaptive_bg_toggle.toggled.connect(self.adaptive_style_picker.setEnabled)
 
         # Corner softness — applies a sticky @radius override on the theming
         # manager (preserved across adaptive clears). Affects all corners
@@ -206,6 +219,8 @@ class SettingsDialog(QDialog):
         appearance_form.addRow("thumbnails:", self.thumbnails_picker)
         appearance_form.addRow("adaptive:", self.adaptive_toggle)
         appearance_form.addRow("", self.adaptive_bg_toggle)
+        appearance_form.addRow("  style:", self.adaptive_style_picker)
+        appearance_form.addRow("", self.adaptive_pulse_toggle)
         appearance_form.addRow("corners:", self.corner_picker)
         appearance_form.addRow("nav icons:", self.nav_icons_picker)
         appearance_form.addRow("font:", self.font_picker)
@@ -241,6 +256,17 @@ class SettingsDialog(QDialog):
         discord_explainer.setWordWrap(True)
         discord_explainer.setProperty("class", "dim")
 
+        self.discord_lyrics_toggle = QCheckBox("show live lyric in presence")
+        self.discord_lyrics_toggle.setEnabled(False)
+
+        discord_lyrics_explainer = QLabel(
+            "when the playing track has synced lyrics, the current line "
+            "replaces artist · album on your profile — visible to everyone, "
+            "and song lyrics can be explicit. off by default."
+        )
+        discord_lyrics_explainer.setWordWrap(True)
+        discord_lyrics_explainer.setProperty("class", "dim")
+
         discord_id_row = QHBoxLayout()
         discord_id_row.addWidget(self.discord_app_id, stretch=1)
         discord_id_row.addWidget(self.discord_help)
@@ -250,6 +276,8 @@ class SettingsDialog(QDialog):
         discord_col.addWidget(self.discord_toggle)
         discord_col.addLayout(discord_id_row)
         discord_col.addWidget(discord_explainer)
+        discord_col.addWidget(self.discord_lyrics_toggle)
+        discord_col.addWidget(discord_lyrics_explainer)
 
         # ---- listenbrainz ----
         lb_heading = QLabel("── listenbrainz scrobbling ──")
@@ -470,6 +498,14 @@ class SettingsDialog(QDialog):
         self.preserve_pitch_toggle.setChecked(bool(self._settings.preserve_pitch))
         self.ui_sounds_toggle.setChecked(bool(self._settings.ui_sounds_enabled))
         self.adaptive_bg_toggle.setChecked(bool(self._settings.adaptive_background))
+        style_idx = self.adaptive_style_picker.findData(
+            self._settings.adaptive_background_style or "field"
+        )
+        if style_idx >= 0:
+            self.adaptive_style_picker.setCurrentIndex(style_idx)
+        self.adaptive_pulse_toggle.setChecked(bool(self._settings.adaptive_pulse))
+        self.adaptive_pulse_toggle.setEnabled(bool(self._settings.adaptive_background))
+        self.adaptive_style_picker.setEnabled(bool(self._settings.adaptive_background))
         corner_idx = self.corner_picker.findData(self._settings.corner_style or "sharp")
         if corner_idx >= 0:
             self.corner_picker.setCurrentIndex(corner_idx)
@@ -488,6 +524,8 @@ class SettingsDialog(QDialog):
         self.discord_toggle.setChecked(self._settings.discord_enabled)
         self.discord_app_id.setText(self._settings.discord_app_id)
         self.discord_app_id.setEnabled(self._settings.discord_enabled)
+        self.discord_lyrics_toggle.setChecked(self._settings.discord_lyrics_enabled)
+        self.discord_lyrics_toggle.setEnabled(self._settings.discord_enabled)
 
         self.lb_toggle.setChecked(self._settings.listenbrainz_enabled)
         self.lb_token.setText(self._settings.listenbrainz_token)
@@ -543,11 +581,13 @@ class SettingsDialog(QDialog):
 
     def _on_discord_toggle(self, on: bool) -> None:
         self.discord_app_id.setEnabled(on)
+        self.discord_lyrics_toggle.setEnabled(on)
 
     def _on_save(self) -> None:
         self._settings.theme = self.theme_picker.currentData() or self._initial_theme
         self._settings.discord_enabled = self.discord_toggle.isChecked()
         self._settings.discord_app_id = self.discord_app_id.text().strip()
+        self._settings.discord_lyrics_enabled = self.discord_lyrics_toggle.isChecked()
         self._settings.show_thumbnails = self.thumbnails_picker.currentData() or "theme"
         self._settings.audio_device = self.audio_device_picker.currentData() or ""
         self._settings.listenbrainz_enabled = self.lb_toggle.isChecked()
@@ -563,6 +603,10 @@ class SettingsDialog(QDialog):
         self._settings.preserve_pitch = self.preserve_pitch_toggle.isChecked()
         self._settings.ui_sounds_enabled = self.ui_sounds_toggle.isChecked()
         self._settings.adaptive_background = self.adaptive_bg_toggle.isChecked()
+        self._settings.adaptive_background_style = (
+            self.adaptive_style_picker.currentData() or "field"
+        )
+        self._settings.adaptive_pulse = self.adaptive_pulse_toggle.isChecked()
         self._settings.corner_style = self.corner_picker.currentData() or "sharp"
         self._settings.nav_icon_set = self.nav_icons_picker.currentData() or "off"
         # Prefer the picker's data (preset family) if it's still selected;
@@ -585,10 +629,17 @@ class SettingsDialog(QDialog):
         self.reject()
 
     def _on_sign_out(self) -> None:
+        # Defer the confirm/inform message boxes past this button's click
+        # emission — a nested modal opened synchronously from a click inside
+        # an already-modal dialog is the PySide6 + py3.14 segfault pattern
+        # ([[feedback-pyside-modal]]).
+        QTimer.singleShot(0, self._do_sign_out)
+
+    def _do_sign_out(self) -> None:
         ok = QMessageBox.question(
             self, "tide",
-            "this will sign out of youtube music and re-open the import "
-            "wizard next time tide starts. continue?",
+            "this will sign out of youtube music. you can sign back in any "
+            "time from settings → sources → the youtube music gear. continue?",
             QMessageBox.Yes | QMessageBox.No,
         )
         if ok != QMessageBox.Yes:
@@ -596,7 +647,7 @@ class SettingsDialog(QDialog):
         auth.clear_saved_auth()
         QMessageBox.information(
             self, "tide",
-            "signed out. quit tide and start it again to sign back in.",
+            "signed out. re-import from settings → sources whenever you like.",
         )
 
     def _on_open_audio_fx(self) -> None:

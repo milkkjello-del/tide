@@ -81,6 +81,9 @@ class Toast(QFrame):
         self._label = QLabel(theming.styled_case(message), self)
         self._label.setWordWrap(True)
         self._label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        # Toast text can carry remote-derived error strings (e.g. a server
+        # error message); plain-text it so markup never renders as HTML.
+        self._label.setTextFormat(Qt.PlainText)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(14, 10, 14, 10)

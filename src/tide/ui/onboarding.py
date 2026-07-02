@@ -525,7 +525,12 @@ class _SourceCard(QFrame):
         row.addWidget(self._status)
 
         self._apply_style()
-        theming.manager().theme_changed.connect(lambda _t: self._apply_style())
+        # Bound method, not a lambda — lambda connections to the global
+        # theming manager outlive the widget and fire into freed C++ objects.
+        theming.manager().theme_changed.connect(self._on_theme_restyle)
+
+    def _on_theme_restyle(self, _theme) -> None:
+        self._apply_style()
 
     def _apply_style(self) -> None:
         theme = theming.manager().current()

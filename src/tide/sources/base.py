@@ -20,6 +20,28 @@ class NotSupportedError(Exception):
     """A source declined a capability call. Caller should treat as graceful."""
 
 
+def safe_int(value: object, default: int = 0) -> int:
+    """Coerce a remote/untrusted value to int, never raising.
+
+    Guards the ``int(server_json.get("duration") or 0)`` pattern: a
+    non-numeric string raises ``ValueError``, and since Python 3.11 so does a
+    numeric string longer than ~4300 digits (int/str conversion limit). A
+    malicious or MITM'd source could send either and crash the worker thread
+    parsing the response, so every duration/count coercion routes through
+    here and falls back to ``default`` instead.
+    """
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        # Last resort for numeric-ish floats/strings like "123.0".
+        try:
+            return int(float(value))
+        except (ValueError, TypeError, OverflowError):
+            return default
+
+
 # ---------- shared dataclasses ----------
 
 @dataclass

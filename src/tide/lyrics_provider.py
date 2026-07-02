@@ -30,6 +30,9 @@ from . import config
 USER_AGENT = "tide/1.0 (https://github.com/captiencelovesarch/tide)"
 LRCLIB_URL = "https://lrclib.net/api/get"
 TIMEOUT_SECONDS = 5.0
+# Bound the LRClib response so a hostile/MITM'd endpoint can't OOM us with a
+# giant body. Lyrics are a few KB; 8 MB is already absurdly generous.
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 
 @dataclass
@@ -63,8 +66,16 @@ def parse_lrc(text: str) -> list[tuple[float, str]]:
             m = _LRC_LINE.match(rest)
             if not m:
                 break
-            mm = int(m.group(1))
-            ss = float(m.group(2))
+            # Timestamps are untrusted remote text. `\d+` is unbounded, and
+            # int() on a >4300-digit string raises ValueError (Python 3.11+
+            # int/str limit) — a crafted LRC line could otherwise abort the
+            # whole parse. Skip any line whose numbers won't convert.
+            try:
+                mm = int(m.group(1))
+                ss = float(m.group(2))
+            except ValueError:
+                rest = m.group(3)
+                continue
             timestamps.append(mm * 60 + ss)
             rest = m.group(3)
         if not timestamps:
@@ -90,9 +101,27 @@ def _load_cache(key: str) -> LyricsResult | None:
             data = json.load(f)
     except Exception:
         return None
+    # A poisoned cache file (attacker with local write to ~/.cache/tide) could
+    # hold rows of the wrong shape/type — e.g. [1,2,3] (unpack error) or
+    # ["x","y"] (float() error). Parse defensively so a bad cache degrades to
+    # a miss rather than raising out of the fetch path.
+    if not isinstance(data, dict):
+        return None
     timed_raw = data.get("timed") or []
-    timed = [(float(t), str(line)) for t, line in timed_raw if isinstance(line, str)]
-    return LyricsResult(plain_text=data.get("plain", "") or "", timed_lines=timed)
+    timed: list[tuple[float, str]] = []
+    if isinstance(timed_raw, list):
+        for row in timed_raw:
+            if not (isinstance(row, (list, tuple)) and len(row) == 2):
+                continue
+            t, line = row
+            if not isinstance(line, str):
+                continue
+            try:
+                timed.append((float(t), line))
+            except (ValueError, TypeError):
+                continue
+    plain = data.get("plain", "")
+    return LyricsResult(plain_text=plain if isinstance(plain, str) else "", timed_lines=timed)
 
 
 def _save_cache(key: str, result: LyricsResult) -> None:
@@ -132,7 +161,7 @@ def fetch_lrclib(*, title: str, artist: str, album: str = "",
         with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
             if resp.status != 200:
                 return None
-            raw = resp.read().decode("utf-8", errors="replace")
+            raw = resp.read(MAX_RESPONSE_BYTES).decode("utf-8", errors="replace")
     except Exception:
         return None
     try:

@@ -12,10 +12,12 @@ delivered on the GUI thread via Qt signals.
 """
 from __future__ import annotations
 
+import math
 import shutil
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 
 import numpy as np
 from PySide6.QtCore import QObject, Signal
@@ -26,6 +28,22 @@ CHUNK = 1024              # samples per FFT chunk; ~23ms at 44.1kHz
 BANDS = 32
 SMOOTH_ALPHA = 0.45
 EPS = 1e-9
+
+# Bass-pulse envelope follower — drives the adaptive-background pulse. Kept
+# separate from the visualizer's band smoothing. The raw low-frequency energy
+# is normalized against a moving floor/peak, so bass-heavy songs establish a
+# new baseline instead of pinning the ambient background at max forever.
+PULSE_LOW_HZ = 30.0
+PULSE_HIGH_HZ = 200.0
+PULSE_GAIN = 6.0          # pre-log gain applied to raw bass magnitude
+PULSE_TOLERANCE = 0.18    # ignore this much of the local bass range
+PULSE_MIN_SPAN = 0.45     # log-domain floor-to-peak range minimum
+PULSE_QUIET_FLOOR = 3.1   # below this, bass is treated as too quiet to pulse
+PULSE_QUIET_FULL = 4.4    # above this, adaptive contrast has full strength
+PULSE_FLOOR_RISE_S = 1.2  # sustained bass becomes "normal" over a few sec
+PULSE_FLOOR_FALL_S = 0.7
+PULSE_PEAK_FALL_S = 1.4
+PULSE_RELEASE_S = 0.35    # decay time constant; attack is instantaneous
 
 
 def _build_band_edges(n_bands: int = BANDS, sample_rate: int = SAMPLE_RATE,
@@ -45,6 +63,79 @@ def _build_band_edges(n_bands: int = BANDS, sample_rate: int = SAMPLE_RATE,
 
 _HANN_WINDOW = np.hanning(CHUNK).astype(np.float32)
 _BAND_EDGES = _build_band_edges()
+
+
+def _pulse_bin_range() -> tuple[int, int]:
+    hz_per_bin = (SAMPLE_RATE / 2.0) / (CHUNK // 2)
+    lo = max(1, int(round(PULSE_LOW_HZ / hz_per_bin)))
+    hi = max(lo + 1, int(round(PULSE_HIGH_HZ / hz_per_bin)))
+    return lo, hi
+
+
+_PULSE_LO, _PULSE_HI = _pulse_bin_range()
+
+
+@dataclass
+class _PulseState:
+    env: float
+    floor: float
+    peak: float
+
+
+def _ema_alpha(dt: float, tau_s: float) -> float:
+    return 1.0 - math.exp(-dt / max(0.001, tau_s))
+
+
+def _smoothstep(edge0: float, edge1: float, value: float) -> float:
+    if edge1 <= edge0:
+        return 1.0 if value >= edge1 else 0.0
+    x = max(0.0, min(1.0, (value - edge0) / (edge1 - edge0)))
+    return x * x * (3.0 - 2.0 * x)
+
+
+def _compute_pulse(samples: np.ndarray, prev: _PulseState | None) -> _PulseState:
+    """Adaptive instant-attack / slow-release bass pulse in 0..1.
+
+    The pulse uses local contrast instead of absolute bass level. On a
+    bass-heavy song, sustained bass raises ``floor`` and stops reading as a
+    permanent hit; transient kicks still jump above the tolerance band.
+    """
+    windowed = samples * _HANN_WINDOW
+    mag = np.abs(np.fft.rfft(windowed))
+    energy = float(mag[_PULSE_LO:_PULSE_HI].mean())
+    raw = math.log1p(energy * PULSE_GAIN)
+    dt = CHUNK / SAMPLE_RATE
+
+    if prev is None:
+        floor = raw * 0.65
+        peak = max(raw, floor + 0.55)
+        env = 0.0
+    else:
+        floor_tau = PULSE_FLOOR_RISE_S if raw > prev.floor else PULSE_FLOOR_FALL_S
+        floor_a = _ema_alpha(dt, floor_tau)
+        floor = prev.floor + (raw - prev.floor) * floor_a
+
+        if raw >= prev.peak:
+            peak = raw
+        else:
+            peak_a = _ema_alpha(dt, PULSE_PEAK_FALL_S)
+            peak = prev.peak + (floor - prev.peak) * peak_a
+            peak = max(peak, raw)
+        env = prev.env
+
+    span = max(PULSE_MIN_SPAN, peak - floor)
+    threshold = floor + span * PULSE_TOLERANCE
+    level = (raw - threshold) / max(EPS, span * (1.0 - PULSE_TOLERANCE))
+    level = max(0.0, min(1.0, level))
+    # Local contrast alone is too twitchy on quiet songs, where tiny absolute
+    # bass changes can fill the local range. Gate it by real bass energy.
+    level *= _smoothstep(PULSE_QUIET_FLOOR, PULSE_QUIET_FULL, raw)
+    if level >= env:
+        env = level
+    else:
+        decay = math.exp(-dt / PULSE_RELEASE_S)
+        env = env * decay + level * (1.0 - decay)
+    return _PulseState(env=env, floor=floor, peak=peak)
 
 
 def _compute_bands(samples: np.ndarray, prev: np.ndarray | None = None) -> np.ndarray:
@@ -126,6 +217,7 @@ def _default_sink_monitor() -> str | None:
 class AudioVisualizerFeed(QObject):
     bands_updated = Signal(object)         # numpy.ndarray (BANDS,)
     waveform_updated = Signal(object)      # numpy.ndarray (CHUNK,)
+    pulse_updated = Signal(float)          # bass-energy envelope, 0..1
     error = Signal(str)
 
     def __init__(self, parent: QObject | None = None) -> None:
@@ -136,6 +228,13 @@ class AudioVisualizerFeed(QObject):
         self._running = False
         self._monitor = "(not started)"
         self._prev_bands: np.ndarray | None = None
+        self._pulse_env: _PulseState | None = None
+        # Reference-counted consumers. The singleton feed is shared by the
+        # visualizer view and the app-wide ambient-pulse controller; capture
+        # runs while at least one consumer holds it so neither tears it down
+        # under the other.
+        self._consumers: set[str] = set()
+        self._preferred_source: str | None = None
 
     @property
     def running(self) -> bool:
@@ -144,6 +243,35 @@ class AudioVisualizerFeed(QObject):
     @property
     def device(self) -> str:
         return self._monitor
+
+    # ---------- reference-counted lifecycle ----------
+
+    def add_consumer(self, name: str, source: str | None = None) -> bool:
+        """Register a consumer and ensure capture is running. Returns True if
+        the feed is live afterwards. ``source`` sets the preferred monitor
+        (used only when the feed has to be (re)started)."""
+        self._consumers.add(name)
+        if source is not None:
+            self._preferred_source = source
+        if not self._running:
+            return self.start(source=self._preferred_source)
+        return True
+
+    def remove_consumer(self, name: str) -> None:
+        """Drop a consumer; stop capture once nobody holds it."""
+        self._consumers.discard(name)
+        if not self._consumers and self._running:
+            self.stop()
+
+    def set_source(self, source: str | None) -> None:
+        """Change the preferred monitor. Restarts an in-flight capture so the
+        new device takes effect while keeping consumers registered."""
+        self._preferred_source = source
+        if self._running:
+            holders = set(self._consumers)
+            self.stop()
+            self._consumers = holders
+            self.start(source=self._preferred_source)
 
     def start(self, source: str | None = None) -> bool:
         if self._running:
@@ -157,21 +285,7 @@ class AudioVisualizerFeed(QObject):
             return False
 
         try:
-            self._proc = subprocess.Popen(
-                [
-                    "parec",
-                    "-d", monitor,
-                    "--rate", str(SAMPLE_RATE),
-                    "--channels", "1",
-                    "--format", "float32le",
-                    "--raw",
-                    "--latency-msec", "10",
-                    "--client-name", "tide-visualizer",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                bufsize=0,
-            )
+            self._proc = self._spawn_parec(monitor)
         except Exception as exc:
             self.error.emit(f"parec failed to start: {exc}")
             return False
@@ -205,30 +319,86 @@ class AudioVisualizerFeed(QObject):
         self._thread = None
         self._running = False
         self._prev_bands = None
+        self._pulse_env = None
+        self._consumers.clear()
 
     # ---------- worker ----------
 
+    def _spawn_parec(self, monitor: str) -> subprocess.Popen:
+        return subprocess.Popen(
+            [
+                "parec",
+                "-d", monitor,
+                "--rate", str(SAMPLE_RATE),
+                "--channels", "1",
+                "--format", "float32le",
+                "--raw",
+                "--latency-msec", "10",
+                "--client-name", "tide-visualizer",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+
     def _process_loop(self) -> None:
         chunk_bytes = CHUNK * 4   # float32
-        assert self._proc is not None and self._proc.stdout is not None
-        stdout = self._proc.stdout
+        respawns = 0
         while not self._stop.is_set():
-            try:
-                data = stdout.read(chunk_bytes)
-            except Exception:
-                break
-            if not data or len(data) < chunk_bytes:
-                # parec died or stream paused — small backoff so we don't spin.
-                if self._stop.wait(0.05):
+            proc = self._proc
+            if proc is None or proc.stdout is None:
+                return
+            stdout = proc.stdout
+            died = False
+            while not self._stop.is_set():
+                try:
+                    data = stdout.read(chunk_bytes)
+                except Exception:
+                    died = True
                     break
-                continue
-            samples = np.frombuffer(data, dtype=np.float32)
+                if not data or len(data) < chunk_bytes:
+                    # Distinguish "stream paused" from "parec exited". A dead
+                    # child returns EOF forever; without the poll() this loop
+                    # spun on it for the rest of the session while the
+                    # process sat unreaped in the table.
+                    if proc.poll() is not None:
+                        died = True
+                        break
+                    if self._stop.wait(0.05):
+                        break
+                    continue
+                respawns = 0   # healthy data — reset the give-up counter
+                samples = np.frombuffer(data, dtype=np.float32)
+                try:
+                    self._prev_bands = _compute_bands(samples, self._prev_bands)
+                except Exception:
+                    continue
+                self.bands_updated.emit(self._prev_bands.copy())
+                self.waveform_updated.emit(samples.copy())
+                try:
+                    self._pulse_env = _compute_pulse(samples, self._pulse_env)
+                except Exception:
+                    self._pulse_env = None
+                else:
+                    self.pulse_updated.emit(float(self._pulse_env.env))
+            if not died or self._stop.is_set():
+                return
+            # parec exited underneath us (sink unplugged, pipewire restart).
+            # Respawn a few times so an audio-server hiccup doesn't
+            # permanently kill the visualizer/ambient pulse mid-session.
+            respawns += 1
+            if respawns > 3:
+                self._running = False
+                self.error.emit("audio capture stopped — parec keeps exiting")
+                return
+            if self._stop.wait(0.5):
+                return
             try:
-                self._prev_bands = _compute_bands(samples, self._prev_bands)
-            except Exception:
-                continue
-            self.bands_updated.emit(self._prev_bands.copy())
-            self.waveform_updated.emit(samples.copy())
+                self._proc = self._spawn_parec(self._monitor)
+            except Exception as exc:
+                self._running = False
+                self.error.emit(f"parec died and couldn't restart: {exc}")
+                return
 
 
 # Singleton.

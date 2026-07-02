@@ -64,6 +64,23 @@ def confirm_spotify_enable(parent: QWidget | None = None) -> bool:
     return dlg.exec() == QMessageBox.Yes
 
 
+# Strong refs to in-flight (QThread, worker) pairs. The thread must NOT be
+# parented to the dialog: callers destroy the dialog right after exec()
+# returns, and destroying a QThread whose OS thread is still running is a
+# Qt fatal abort. Instead the pair lives here until the thread finishes;
+# thread.finished → deleteLater (processed on the main loop, where
+# ~QThread safely waits out the run's last instants), then
+# thread.destroyed → drop the strong ref. Late done/failed emissions into
+# an already-destroyed dialog are auto-disconnected by Qt and dropped.
+_ACTIVE_THREADS: set[tuple[QThread, QObject]] = set()
+
+
+def _keep_alive(thread: QThread, worker: QObject) -> None:
+    entry = (thread, worker)
+    _ACTIVE_THREADS.add(entry)
+    thread.destroyed.connect(lambda *_: _ACTIVE_THREADS.discard(entry))
+
+
 class _AuthWorker(QObject):
     done = Signal(object)        # SpotifyTokens
     failed = Signal(str)
@@ -177,7 +194,7 @@ class SpotifySignInDialog(QDialog):
         self._flow = flow
         QDesktopServices.openUrl(QUrl(url))
 
-        thread = QThread(self)
+        thread = QThread()   # unparented: must be able to outlive the dialog
         worker = _AuthWorker(flow)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -187,6 +204,7 @@ class SpotifySignInDialog(QDialog):
         worker.failed.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
+        _keep_alive(thread, worker)
         self._thread = thread
         self._worker = worker
         thread.start()
@@ -202,8 +220,13 @@ class SpotifySignInDialog(QDialog):
         self._status.setText(f"sign-in failed: {msg}")
         self._connect_btn.setEnabled(True)
 
-    def reject(self) -> None:
-        # If the OAuth thread is mid-wait, the loopback server will time
-        # out on its own (~3 min). That's acceptable since we're about to
-        # close the dialog and the user moves on.
-        super().reject()
+    def done(self, result: int) -> None:
+        # Every close path (cancel button, Esc, titlebar ✕, accept) funnels
+        # through done(). If the OAuth thread is mid-wait on the loopback
+        # server, cancel() wakes it so it raises and winds down promptly
+        # instead of blocking for up to 300s; the _keep_alive registry keeps
+        # the QThread safe to outlive the dialog either way. After a
+        # successful flow cancel() is a no-op.
+        if self._flow is not None:
+            self._flow.cancel()
+        super().done(result)

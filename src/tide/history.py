@@ -9,7 +9,10 @@ the listening pattern.
 """
 from __future__ import annotations
 
+import fcntl
 import json
+import os
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +50,33 @@ class HistoryEntry:
         )
 
 
+def _acquire_lock(path: Path) -> int | None:
+    """flock a sidecar `<name>.lock` file (created 0o600) and return its fd.
+
+    We lock a sidecar rather than the history file itself because rotation
+    replaces the history inode: a second writer that opened the old inode
+    and then won the flock would append into an orphaned file — exactly the
+    silent drop this lock exists to prevent. The sidecar is never replaced,
+    so every locker contends on the same inode. Returns None if locking is
+    impossible (exotic FS); callers proceed unlocked rather than drop the
+    play.
+    """
+    try:
+        fd = os.open(
+            path.with_name(path.name + ".lock"),
+            os.O_CREAT | os.O_WRONLY,
+            0o600,
+        )
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
 def append(track: Track) -> None:
     if not track or not track.video_id:
         return
@@ -63,12 +93,28 @@ def append(track: Track) -> None:
         "source": getattr(track, "source", "") or "ytmusic",
         "played_at": time.time(),
     }
+    # Append + rotate form one critical section so a rotation can never
+    # rewrite the file out from under a concurrent append.
+    lock_fd = _acquire_lock(path)
     try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
-    except OSError:
-        return
-    _maybe_rotate(path)
+        try:
+            # 0o600 at create — subsonic stream URLs can embed credentials.
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError:
+            return
+        try:
+            os.chmod(path, 0o600)  # tighten files created by older versions
+        except OSError:
+            pass
+        _maybe_rotate(path)
+    finally:
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)  # closing drops the flock
+            except OSError:
+                pass
 
 
 def _maybe_rotate(path: Path) -> None:
@@ -80,11 +126,21 @@ def _maybe_rotate(path: Path) -> None:
     if len(lines) <= MAX_LINES_RETAINED:
         return
     keep = lines[-MAX_LINES_RETAINED:]
-    tmp = path.with_suffix(".tmp")
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        # Unique temp (mkstemp => 0o600) + fsync so the replace is atomic
+        # and durable — a fixed-name temp could be clobbered by a peer.
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+        )
+    except OSError:
+        return
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.writelines(keep)
-        tmp.replace(path)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
     except OSError:
         try:
             tmp.unlink(missing_ok=True)

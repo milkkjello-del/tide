@@ -64,6 +64,11 @@ class _LineLabel(QLabel):
         self.setWordWrap(True)
         self.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.setAlignment(Qt.AlignLeft)
+        # Lyric text is remote (LRClib / YT Music). QLabel's default AutoText
+        # would render a line like "<b><font size=40>…" as HTML; force
+        # PlainText so lines always display literally. (The karaoke path
+        # builds its own escaped rich text separately.)
+        self.setTextFormat(Qt.PlainText)
 
 
 class _KaraokeWidget(QWidget):
@@ -241,6 +246,8 @@ class LyricsView(QWidget):
 
         self.heading = QLabel(_line_heading("lyrics"))
         self.heading.setProperty("class", "dim")
+        # Heading embeds the remote track title (see show_for); plain-text it.
+        self.heading.setTextFormat(Qt.PlainText)
 
         # Toggles bar — karaoke mode + (v1.2.1 second-half) mute-lyrics
         # instrumental-swap button. Lives in this view per the spec, NOT
@@ -272,6 +279,9 @@ class LyricsView(QWidget):
         self._plain_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self._plain_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._plain_label.setContentsMargins(0, 6, 0, 6)
+        # Untimed lyrics are a remote text block — plain-text it so markup in
+        # the lyrics can't render as HTML.
+        self._plain_label.setTextFormat(Qt.PlainText)
 
         self._timed_host = QWidget()
         self._timed_layout = QVBoxLayout(self._timed_host)
@@ -280,6 +290,10 @@ class LyricsView(QWidget):
         self._timed_layout.addStretch(1)
 
         self._karaoke_widget = _KaraokeWidget()
+        # Named so the adaptive-background QSS transparentizes this container
+        # (a QWidget subclass, so it isn't caught by the `.QWidget` rule) and
+        # the gradient shows behind the karaoke lines. See theming._CONTENT_BACKDROP_QSS.
+        self._karaoke_widget.setObjectName("lyricsKaraoke")
 
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)

@@ -1,12 +1,12 @@
 """UI sound dispatcher — clicks, modal pops, toggle chirps.
 
-A single ``UiSoundPlayer`` instance owns a ``QSoundEffect`` per known
-sound key. Call sites do ``window.ui_sounds.play("nav")`` — the dispatch
-is short-circuited when the master toggle is off, when music is playing
-(set via ``set_muted``), or when the key has no WAV registered.
+A single ``UiSoundPlayer`` instance owns paths to known sound files. Call
+sites do ``window.ui_sounds.play("nav")`` — the dispatch is short-circuited
+when the master toggle is off, when music is playing (set via ``set_muted``),
+or when the key has no WAV registered.
 
-WAVs live in ``<repo>/assets/sounds/`` and ship with the package. The
-loader is lenient: any missing file silently disables that key, so the
+WAVs live in ``tide/sounds/`` inside the package and ship with the wheel.
+The loader is lenient: any missing file silently disables that key, so the
 feature degrades cleanly on a fresh checkout where the user hasn't
 authored every sound yet.
 
@@ -16,10 +16,11 @@ so UI sounds reappear automatically the moment playback pauses / ends.
 """
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QUrl, Slot
-from PySide6.QtMultimedia import QSoundEffect
+from PySide6.QtCore import QObject, Slot
 
 
 # All known sound keys with their on-disk filenames. Extending this is the
@@ -41,21 +42,32 @@ DEFAULT_VOLUME = 0.20
 
 
 def _default_sounds_dir() -> Path:
-    """The bundled assets/sounds dir relative to this file. Walks up
-    until it finds a sibling ``assets`` dir so both an installed wheel
-    layout and a from-checkout layout work."""
+    """The bundled sounds dir. As of v1.2.4 the WAVs live inside the
+    package (``tide/sounds``) so installed wheels actually ship them —
+    the old repo-root ``assets/sounds`` was never packaged, which made UI
+    sounds silently dead on every pacman/pip install. The walk-up is kept
+    as a fallback for older checkouts."""
     here = Path(__file__).resolve()
+    packaged = here.parent / "sounds"
+    if packaged.is_dir():
+        return packaged
     for parent in [here.parent, *here.parents]:
         candidate = parent / "assets" / "sounds"
         if candidate.is_dir():
             return candidate
-    # Fallback to the conventional repo-root path even if it doesn't
-    # exist — the loader will just find no files and every key no-ops.
-    return here.parent.parent.parent / "assets" / "sounds"
+    # Nothing found — return the packaged path anyway; the loader just
+    # finds no files and every key no-ops.
+    return packaged
 
 
 class UiSoundPlayer(QObject):
-    """Thin wrapper around a dict of ``QSoundEffect``s."""
+    """Tiny WAV dispatcher.
+
+    This deliberately avoids ``QSoundEffect``. On some QtMultimedia/PipeWire
+    stacks, constructing QSoundEffect can segfault the process before Python
+    can catch anything. Spawning pw-play/paplay is less fancy, but it keeps UI
+    sounds optional and cannot take Tide down at startup.
+    """
 
     def __init__(self, sounds_dir: Path | None = None,
                  parent: QObject | None = None) -> None:
@@ -63,27 +75,27 @@ class UiSoundPlayer(QObject):
         self._enabled = False
         self._muted = False
         self._volume = DEFAULT_VOLUME
-        self._effects: dict[str, QSoundEffect] = {}
+        self._sounds: dict[str, Path] = {}
         self._sounds_dir = Path(sounds_dir) if sounds_dir else _default_sounds_dir()
+        self._player = self._find_player()
         self._load()
 
     # ---------- loading ----------
 
+    def _find_player(self) -> str | None:
+        for name in ("pw-play", "paplay", "aplay"):
+            path = shutil.which(name)
+            if path:
+                return path
+        return None
+
     def _load(self) -> None:
-        """Instantiate a QSoundEffect for each WAV present. Missing
-        files are skipped (the key is simply absent from the dict).
-        QSoundEffect parses headers lazily, so any malformed file
-        surfaces as a load-failed status the first time the key fires —
-        we don't try to validate up-front.
-        """
+        """Register each WAV present. Missing files are skipped."""
         for key, filename in SOUND_KEYS.items():
             path = self._sounds_dir / filename
             if not path.is_file():
                 continue
-            effect = QSoundEffect(self)
-            effect.setSource(QUrl.fromLocalFile(str(path)))
-            effect.setVolume(self._volume)
-            self._effects[key] = effect
+            self._sounds[key] = path
 
     # ---------- knobs ----------
 
@@ -98,36 +110,45 @@ class UiSoundPlayer(QObject):
         self._muted = bool(muted)
 
     def set_volume(self, volume: float) -> None:
-        clamped = max(0.0, min(1.0, float(volume)))
-        self._volume = clamped
-        for effect in self._effects.values():
-            try:
-                effect.setVolume(clamped)
-            except Exception:
-                pass
+        self._volume = max(0.0, min(1.0, float(volume)))
 
     # ---------- the API call sites use ----------
+
+    def _command(self, path: Path) -> list[str] | None:
+        if self._player is None:
+            return None
+        name = Path(self._player).name
+        if name == "pw-play":
+            return [self._player, "--volume", f"{self._volume:.3f}", str(path)]
+        if name == "paplay":
+            volume = str(round(self._volume * 65536))
+            return [self._player, "--volume", volume, str(path)]
+        return [self._player, str(path)]
 
     @Slot(str)
     def play(self, key: str) -> None:
         if not self._enabled or self._muted:
             return
-        effect = self._effects.get(key)
-        if effect is None:
+        path = self._sounds.get(key)
+        if path is None:
+            return
+        cmd = self._command(path)
+        if cmd is None:
             return
         try:
-            # ``stop`` + ``play`` together so rapid repeated nav clicks
-            # don't queue and instead retrigger from the head — feels
-            # better when spamming nav buttons.
-            effect.stop()
-            effect.play()
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
         except Exception:
             pass
 
     # ---------- introspection ----------
 
     def available_keys(self) -> list[str]:
-        return list(self._effects.keys())
+        return list(self._sounds.keys())
 
     @property
     def enabled(self) -> bool:

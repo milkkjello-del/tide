@@ -9,6 +9,7 @@ Stream resolution is delegated to ``yt-dlp`` and cached per source via
 """
 from __future__ import annotations
 
+import threading
 from typing import Iterable
 
 import yt_dlp
@@ -28,10 +29,77 @@ from .base import (
     ShelfItem,
     StreamRef,
     Track,
+    safe_int,
 )
 
 
 SOURCE_SLUG = "ytmusic"
+
+# Anonymous client used ONLY for timed lyrics — the mobile context that
+# serves timestamps rejects signed-in browser cookies with HTTP 400 (see
+# YTMusicSource._yt_timed_lyrics). Lazy: constructed on the first lyrics
+# fetch, which always runs on a worker thread.
+_anon_lyrics: YTMusic | None = None
+_ANON_LYRICS_LOCK = threading.Lock()
+
+
+def _anon_lyrics_client() -> YTMusic:
+    global _anon_lyrics
+    with _ANON_LYRICS_LOCK:
+        if _anon_lyrics is None:
+            _anon_lyrics = YTMusic()
+        return _anon_lyrics
+
+
+_AUTH_ERROR_MARKERS = ("http 401", "unauthenticated", "authentication credential")
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    """True when an exception from ytmusicapi looks like dead cookie auth.
+
+    Expired/rotated cookies surface as ``YTMusicServerError("Server returned
+    HTTP 401: Unauthorized.\\n<google detail>")`` where the detail mentions
+    the missing "authentication credential". Matched on message text rather
+    than exception type so a requests-level error from a future ytmusicapi
+    still registers.
+    """
+    text = str(exc).lower()
+    return any(marker in text for marker in _AUTH_ERROR_MARKERS)
+
+
+class _AuthSentinel:
+    """Transparent wrapper around a YTMusic client that watches every call
+    for auth-shaped failures.
+
+    Cookie auth doesn't announce its own death — YouTube just starts
+    returning 401 and the layers above either surface a generic error
+    string or swallow it and render empty (home → ``[]``, artist → ``None``,
+    …), so the user never learns the fix is "import fresh cookies". The
+    sentinel sees the 401 in flight, reports it via the callback, and
+    re-raises, so callers keep exactly their old behavior.
+    """
+
+    def __init__(self, yt: YTMusic, on_auth_error) -> None:
+        self._yt = yt
+        self._on_auth_error = on_auth_error
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._yt, name)
+        if not callable(attr):
+            return attr
+
+        def guarded(*args, **kwargs):
+            try:
+                return attr(*args, **kwargs)
+            except Exception as exc:
+                if _is_auth_error(exc):
+                    try:
+                        self._on_auth_error()
+                    except Exception:
+                        pass
+                raise
+
+        return guarded
 
 
 def _join_artists(items: Iterable[dict] | None) -> str:
@@ -61,7 +129,7 @@ def _to_track(item: dict) -> Track | None:
     if not vid:
         return None
     duration = item.get("duration") or item.get("length") or ""
-    secs = int(item.get("duration_seconds") or 0)
+    secs = safe_int(item.get("duration_seconds"))
     if secs == 0 and duration and ":" in duration:
         secs = _parse_hms(duration)
     album = ""
@@ -100,13 +168,37 @@ class YTMusicSource(MusicSource):
     STREAM_TTL_SECONDS = 4 * 3600          # YT CDN URLs last ~6h
 
     def __init__(self, yt: YTMusic) -> None:
-        self.yt = yt
+        self.yt = _AuthSentinel(yt, self._on_auth_error)
         self._signed_out = False
+        self._auth_expired = False
 
     # ---------- auth surface ----------
 
+    def _on_auth_error(self) -> None:
+        """Sentinel callback — runs on whatever worker thread hit the 401.
+
+        One-shot per session: the flag flips before the registry emits, and
+        ``begin_auth()`` resets it, so a dead cookie jar produces exactly one
+        notification instead of one per failed request.
+        """
+        if self._auth_expired or self._signed_out:
+            return
+        self._auth_expired = True
+        from . import registry
+        registry().notify_auth_expired(self.slug)
+
+    def probe_auth(self) -> None:
+        """One cheap authenticated round-trip.
+
+        Called off-thread at startup so expired cookies are reported the
+        moment the app opens, not whenever the user first browses. Raises
+        on failure; the sentinel takes care of classifying/reporting, so
+        callers can swallow freely.
+        """
+        self.yt.get_account_info()
+
     def is_authenticated(self) -> bool:
-        return self.yt is not None and not self._signed_out
+        return self.yt is not None and not self._signed_out and not self._auth_expired
 
     def sign_out(self) -> None:
         """Delete the saved cookie auth and mark this live source signed-out.
@@ -141,13 +233,16 @@ class YTMusicSource(MusicSource):
         if dlg.exec() != dlg.DialogCode.Accepted:
             return False
         try:
-            self.yt = auth.yt_client()
+            self.yt = _AuthSentinel(auth.yt_client(), self._on_auth_error)
         except Exception:
             return False
         self._signed_out = False
+        self._auth_expired = False
         return True
 
     def status_text(self) -> str:
+        if self._auth_expired and not self._signed_out:
+            return "session expired — sign in to fix"
         return "signed in (cookie import)" if self.is_authenticated() else "sign in via [import]"
 
     # ---------- required ----------
@@ -444,25 +539,88 @@ class YTMusicSource(MusicSource):
             return None
         return text
 
+    def _yt_timed_lyrics(self, video_id: str):
+        """YouTube Music's own line-synced lyrics for this exact video.
+
+        Preferred over LRClib for timing: LRClib matches by title/artist
+        text and its sync regularly belongs to a *different* recording
+        (album cut vs music video vs remaster), which is exactly what makes
+        the karaoke highlight drift off the audio. YT's timestamps are
+        authored against the video being played, so they can't mismatch.
+
+        Quirk that shapes this code: YT only serves timestamps to mobile
+        clients (``as_mobile()``), and it rejects the mobile context with
+        HTTP 400 when the request carries signed-in browser cookies. Lyrics
+        are public data, so a dedicated ANONYMOUS client does the timed
+        fetch — the signed-in client is never touched. Verified live:
+        authed+mobile → 400; anonymous+mobile → hasTimestamps=True.
+        """
+        from ..lyrics_provider import LyricsResult
+        if not video_id:
+            return None
+        try:
+            client = _anon_lyrics_client()
+            # as_mobile() mutates the shared client's context for the
+            # duration of the block — serialize so overlapping lyric
+            # workers (fast track skips) can't interleave contexts.
+            with _ANON_LYRICS_LOCK, client.as_mobile():
+                wp = client.get_watch_playlist(videoId=video_id)
+                browse_id = wp.get("lyrics") if isinstance(wp, dict) else None
+                if not browse_id:
+                    return None
+                lyr = client.get_lyrics(browse_id, timestamps=True)
+        except Exception:
+            return None
+        if not lyr:
+            return None
+        body = lyr.get("lyrics") if isinstance(lyr, dict) else getattr(lyr, "lyrics", None)
+        if not isinstance(body, list):
+            return None
+        # LyricLine objects (or dicts) with `text` + `start_time` in ms.
+        timed: list[tuple[float, str]] = []
+        texts: list[str] = []
+        for ln in body:
+            if isinstance(ln, dict):
+                text = str(ln.get("text") or "")
+                start = ln.get("start_time")
+            else:
+                text = str(getattr(ln, "text", "") or "")
+                start = getattr(ln, "start_time", None)
+            if start is None:
+                continue
+            try:
+                secs = float(start) / 1000.0
+            except (TypeError, ValueError):
+                continue
+            texts.append(text)
+            timed.append((secs, text))
+        timed.sort(key=lambda x: x[0])
+        if not timed:
+            return None
+        return LyricsResult(plain_text="\n".join(texts), timed_lines=timed)
+
     def get_lyrics_for_track(self, track: Track):
         from ..lyrics_provider import LyricsResult, fetch_lrclib
-        plain = self.get_lyrics_for(track.video_id)
-        if plain:
-            timed = fetch_lrclib(
-                title=track.title or "",
-                artist=track.artists or "",
-                album=track.album or "",
-                duration_seconds=int(track.duration_seconds or 0),
-            )
-            if timed is not None and timed.has_timed:
-                return LyricsResult(plain_text=plain, timed_lines=timed.timed_lines)
-            return LyricsResult(plain_text=plain)
-        return fetch_lrclib(
+        # 1. YT's own sync for this exact video — immune to wrong-version
+        #    drift, so it wins whenever it exists.
+        timed = self._yt_timed_lyrics(track.video_id)
+        if timed is not None:
+            return timed
+        # 2. Plain lyrics from the signed-in client + LRClib's community
+        #    sync as the timing fallback (previous behavior).
+        plain = self.get_lyrics_for(track.video_id) or ""
+        lrc = fetch_lrclib(
             title=track.title or "",
             artist=track.artists or "",
             album=track.album or "",
             duration_seconds=int(track.duration_seconds or 0),
         )
+        if lrc is not None and lrc.has_timed:
+            return LyricsResult(plain_text=plain or lrc.plain_text,
+                                timed_lines=lrc.timed_lines)
+        if plain:
+            return LyricsResult(plain_text=plain)
+        return lrc
 
     def get_radio(self, video_id: str, exclude: set[str] | None = None) -> list[Track]:
         if not video_id:
@@ -500,8 +658,26 @@ def resolve_stream_url(video_id: str) -> str:
         "noplaylist": True,
     }
     url = f"https://music.youtube.com/watch?v={video_id}"
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+
+    # Resolve as the signed-in user when we have cookies. This is what lets
+    # playback work with no browser tab open — yt-dlp authenticates from the
+    # cookies harvested at sign-in instead of hitting YouTube anonymously
+    # (which triggers bot-checks / age-gates). If the cookies are stale and
+    # the authenticated pass fails, fall back to an anonymous resolve so a
+    # bad cookie jar can never be *worse* than having none.
+    from .. import auth
+    cookiefile = auth.yt_dlp_cookiefile()
+
+    info = None
+    if cookiefile:
+        try:
+            with yt_dlp.YoutubeDL({**opts, "cookiefile": cookiefile}) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception:
+            info = None
+    if info is None:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
 
     stream_url = info.get("url")
     if not stream_url and "requested_formats" in info:

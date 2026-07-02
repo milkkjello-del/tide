@@ -64,38 +64,39 @@ from .widgets import AlbumArt, BracketButton, MonoProgress, MonoVolume, NowPlayi
 
 
 class _SearchWorker(QObject):
-    done = Signal(str, list)        # filter, results
-    failed = Signal(str)
+    done = Signal(int, str, list)   # request gen, filter, results
+    failed = Signal(int, str)       # request gen, error
 
-    def __init__(self, api_obj: api.Api, query: str, filter_: str) -> None:
+    def __init__(self, api_obj: api.Api, query: str, filter_: str, gen: int) -> None:
         super().__init__()
         self.api = api_obj
         self.query = query
         self.filter = filter_
+        self.gen = gen
 
     def run(self) -> None:
         try:
             supports = getattr(self.api, "supports", lambda _c: True)
             if self.filter == "albums":
                 if not supports("albums"):
-                    self.done.emit(self.filter, [])
+                    self.done.emit(self.gen, self.filter, [])
                     return
                 out = self.api.search_albums(self.query)
             elif self.filter == "artists":
                 if not supports("artists"):
-                    self.done.emit(self.filter, [])
+                    self.done.emit(self.gen, self.filter, [])
                     return
                 out = self.api.search_artists(self.query)
             elif self.filter == "videos":
                 if not supports("videos"):
-                    self.done.emit(self.filter, [])
+                    self.done.emit(self.gen, self.filter, [])
                     return
                 out = self.api.search_videos(self.query)
             else:
                 out = self.api.search_songs(self.query)
-            self.done.emit(self.filter, out)
+            self.done.emit(self.gen, self.filter, out)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(self.gen, str(exc))
 
 
 class _FederatedSearchWorker(QObject):
@@ -106,12 +107,13 @@ class _FederatedSearchWorker(QObject):
     """
 
     partial = Signal(str, list)         # source slug, tracks
-    done = Signal(str, list)             # filter, all_tracks
-    failed = Signal(str)
+    done = Signal(int, str, list)        # request gen, filter, all_tracks
+    failed = Signal(int, str)            # request gen, error
 
-    def __init__(self, query: str) -> None:
+    def __init__(self, query: str, gen: int) -> None:
         super().__init__()
         self.query = query
+        self.gen = gen
         self._collected: list = []
         self._remaining: int = 0
         self._lock_remaining = False
@@ -121,7 +123,7 @@ class _FederatedSearchWorker(QObject):
         from ..sources import registry as _registry
         sources = _registry().enabled_sources()
         if not sources:
-            self.done.emit("songs", [])
+            self.done.emit(self.gen, "songs", [])
             return
         self._remaining = len(sources)
 
@@ -150,7 +152,7 @@ class _FederatedSearchWorker(QObject):
         self._collected.extend(tracks)
         self._remaining -= 1
         if self._remaining <= 0:
-            self.done.emit("songs", list(self._collected))
+            self.done.emit(self.gen, "songs", list(self._collected))
 
 
 class _ResolveWorker(QObject):
@@ -247,6 +249,12 @@ class MainWindow(QMainWindow):
         # thread / worker refs (hold to prevent GC during run())
         self._search_thread: QThread | None = None
         self._search_worker: _SearchWorker | None = None
+        # Monotonic id for search requests. Results/failures carry the id of
+        # the request that produced them; anything not matching the latest id
+        # is a straggler from an abandoned query and gets dropped — otherwise
+        # a slow "abba" search lands after a fast "beatles" one and appends
+        # its rows into the beatles result list.
+        self._search_gen = 0
         self._resolve_thread: QThread | None = None
         self._resolve_worker: _ResolveWorker | None = None
         self._radio_thread: QThread | None = None
@@ -567,6 +575,11 @@ class MainWindow(QMainWindow):
         self.source_view.settings_changed.connect(self._persist_settings)
         self.source_view.settings_changed.connect(self._refresh_search_placeholder)
         self.source_view.local_dir_changed.connect(self._on_local_dir_changed)
+        # Session-death notifications (e.g. imported YT Music cookies started
+        # 401ing). Sources report from worker threads; AutoConnection queues
+        # delivery onto this (GUI) thread, so the slot may build widgets.
+        self._auth_expired_toasted: set[str] = set()
+        source_registry().auth_expired.connect(self._on_source_auth_expired)
 
         # ----- audio FX panel -----
         from .audio_fx_view import AudioFxView
@@ -579,6 +592,9 @@ class MainWindow(QMainWindow):
         # a hidden placeholder so the existing _switch_view branches that
         # reference idx 5 keep working — they're rerouted to "home" below.
         self.stack = QStackedWidget()
+        # Named so the adaptive-background QSS can transparentize content
+        # containers and QScrollArea viewports. See theming._CONTENT_BACKDROP_QSS.
+        self.stack.setObjectName("contentStack")
         self.stack.addWidget(search_view)            # 0 — home (search + explore)
         self.stack.addWidget(self.library_view)      # 1
         self.stack.addWidget(queue_view)             # 2
@@ -594,19 +610,13 @@ class MainWindow(QMainWindow):
         # Simple back stack of previous indices so AlbumView/ArtistView can pop.
         self._view_history: list[int] = []
 
-        # Wrap the central stack in a paint-driven background so it can show
-        # the adaptive-tinted vertical gradient and/or soft corners. The
-        # CentralBg sits between the nav rail and the stack; it owns the
-        # stack via layout, so reparenting is automatic.
-        from .central_bg import CentralBg
-        self.central_bg = CentralBg(self.stack)
-
         upper = QHBoxLayout()
         upper.setContentsMargins(0, 0, 0, 0)
         upper.setSpacing(0)
         upper.addWidget(nav)
-        upper.addWidget(self.central_bg, stretch=1)
+        upper.addWidget(self.stack, stretch=1)
         upper_wrap = QWidget()
+        upper_wrap.setObjectName("appUpper")
         upper_wrap.setLayout(upper)
         self._upper_wrap_widget = upper_wrap
 
@@ -630,6 +640,9 @@ class MainWindow(QMainWindow):
         self.up_next.setProperty("class", "dim")
         self.up_next.setVisible(False)
         self.up_next.setContentsMargins(0, 0, 0, 2)
+        # Shows remote artist — title of the next track; plain-text so it
+        # can't render as HTML (AutoText default).
+        self.up_next.setTextFormat(Qt.PlainText)
 
         self._controls_bundle = make_controls(self._slot_controls)
         self.prev_btn = self._controls_bundle.prev_btn
@@ -685,8 +698,16 @@ class MainWindow(QMainWindow):
         root.addWidget(upper_wrap, stretch=1)
         root.addWidget(strip)
         central = QWidget()
+        central.setObjectName("appSurface")
         central.setLayout(root)
-        self.setCentralWidget(central)
+
+        # Paint the adaptive backdrop behind the whole app surface, not just
+        # the content stack. Structural panes are transparentized in
+        # theming._CONTENT_BACKDROP_QSS, so nav/content/now-playing read as
+        # one clean surface while controls keep their own QSS backgrounds.
+        from .central_bg import CentralBg
+        self.central_bg = CentralBg(central)
+        self.setCentralWidget(self.central_bg)
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("ready")
         # Loading indicator — drives the status bar with a progress bar while
@@ -761,6 +782,64 @@ class MainWindow(QMainWindow):
         src = getattr(self, "api", None)
         name = getattr(src, "name", "") or "youtube music"
         self.search.setPlaceholderText(f"search {name}…")
+
+    def _on_source_auth_expired(self, slug: str) -> None:
+        """A source's saved session stopped authenticating (expired cookies).
+
+        Raise ONE sticky toast with a [sign in] action instead of letting
+        search / library / home silently degrade into empty views — that
+        silence was the old behavior and it made expiry look like random
+        breakage."""
+        if slug in self._auth_expired_toasted:
+            return
+        self._auth_expired_toasted.add(slug)
+        source = source_registry().get(slug)
+        name = getattr(source, "name", slug) or slug
+        from .toast import show_toast
+        show_toast(
+            self,
+            f"{name}: session expired — the imported cookies no longer work, "
+            "so search, library and home may come up empty or fail. "
+            "sign in again to fix it.",
+            action_label="sign in",
+            on_action=lambda: self._begin_source_reauth(slug),
+        )
+        # Keep the Sources tab honest too (dot → warn, status → expired).
+        try:
+            self.source_view.refresh_statuses()
+            self.source_view._refresh_dot_for(slug)
+        except Exception:
+            pass
+
+    def _begin_source_reauth(self, slug: str) -> None:
+        """Toast-action handler. The modal must NOT open inside the click
+        handler (PySide6 + py3.14 segfault) — defer a tick, then run the
+        source panel's shared re-auth flow."""
+        def _open() -> None:
+            try:
+                ok = self.source_view.reauth_source(slug)
+            except Exception:
+                ok = False
+            # Either way, allow a future expiry to re-notify: on success the
+            # source's flag was reset; on cancel the user said "not now" and
+            # the Sources tab keeps showing the expired state.
+            self._auth_expired_toasted.discard(slug)
+            if not ok:
+                return
+            source = source_registry().get(slug)
+            from .toast import show_toast
+            show_toast(self, f"{getattr(source, 'name', slug)}: signed back in")
+            if source_registry().active_slug == slug:
+                # Reload the views that went stale/empty under the dead session.
+                try:
+                    self.explore_view.reload()
+                except Exception:
+                    pass
+                try:
+                    self.library_view.reload_playlists()
+                except Exception:
+                    pass
+        QTimer.singleShot(0, _open)
 
     def _on_source_enabled_changed(self, slug: str, enabled: bool) -> None:
         if slug == "local" and enabled:
@@ -879,6 +958,10 @@ class MainWindow(QMainWindow):
     # ---------- search ----------
 
     def _on_search(self) -> None:
+        # Invalidate any in-flight search first — even on the empty-query
+        # path, so a straggler can't paint results over the home screen.
+        self._search_gen += 1
+        gen = self._search_gen
         q = self.search.text().strip()
         if not q:
             self._enter_home_mode()
@@ -897,7 +980,7 @@ class MainWindow(QMainWindow):
 
         if federated:
             self.statusBar().showMessage(f"federated search: {q}")
-            worker = _FederatedSearchWorker(q)
+            worker = _FederatedSearchWorker(q, gen)
             # Federated worker uses QThreadPool internally — no QThread needed.
             worker.done.connect(self._on_results)
             worker.failed.connect(self._on_search_failed)
@@ -907,7 +990,7 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage(f"searching {self._search_filter}: {q}")
         thread = QThread(self)
-        worker = _SearchWorker(self.api, q, self._search_filter)
+        worker = _SearchWorker(self.api, q, self._search_filter, gen)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.done.connect(self._on_results)
@@ -928,8 +1011,12 @@ class MainWindow(QMainWindow):
         if self.search.text().strip():
             self._on_search()
 
-    def _on_results(self, filter_: str, items: list) -> None:
+    def _on_results(self, gen: int, filter_: str, items: list) -> None:
+        if gen != self._search_gen:
+            return   # straggler from an abandoned query
         # Filter could have changed since this query started — discard stale.
+        # (Still needed alongside the gen: switching filters with an empty
+        # search box doesn't start a new search, so it doesn't bump the gen.)
         if filter_ != self._search_filter:
             return
         if not items:
@@ -980,7 +1067,9 @@ class MainWindow(QMainWindow):
                 c.clicked.connect(self._open_artist_entry)
             self.results_cards.add_card(c)
 
-    def _on_search_failed(self, msg: str) -> None:
+    def _on_search_failed(self, gen: int, msg: str) -> None:
+        if gen != self._search_gen:
+            return   # a newer search is running/done — don't clobber it
         self.heading.setText(self._line_heading("search failed"))
         self.statusBar().showMessage(f"search failed: {msg}")
 
@@ -1349,6 +1438,7 @@ class MainWindow(QMainWindow):
 
     def _wire_queue(self) -> None:
         self.queue.current_changed.connect(self._on_queue_current_changed)
+        self.queue.current_removed.connect(self._on_queue_current_removed)
         self.queue.refill_requested.connect(self._on_radio_refill_requested)
         self.queue.radio_state_changed.connect(self._on_radio_state_changed)
         self.queue.rowsInserted.connect(self._on_queue_size_changed)
@@ -1367,6 +1457,25 @@ class MainWindow(QMainWindow):
         )
         self._refresh_nav_buttons()
         self._refresh_up_next()
+
+    def _on_queue_current_removed(self, track) -> None:
+        """The playing row was removed from the queue. The model already
+        moved the current pointer; here we reconcile the *audio*. If a track
+        took the removed slot, skip to it (only when the removed row was the
+        one actually playing — otherwise a stopped/paused queue shouldn't
+        spontaneously start). If nothing shifted in, stop."""
+        was_playing = self.player.state in (PlayState.PLAYING, PlayState.LOADING, PlayState.PAUSED)
+        if track is not None:
+            if was_playing:
+                self._play_track(track)
+        else:
+            # Nothing to advance to — halt playback and drop the now-stale
+            # now-playing track ref.
+            try:
+                self.player.stop()
+            except Exception:
+                pass
+            self._current = None
 
     def _on_queue_current_changed(self, _track) -> None:
         self._refresh_nav_buttons()
@@ -1610,15 +1719,29 @@ class MainWindow(QMainWindow):
         crossfade something to fade from. Only when the new track has no
         thumbnail at all do we wipe to the empty state.
         """
-        if not track.thumbnail:
+        from .art_cache import (
+            ART_TRANSFER_TIMEOUT_MS,
+            MAX_ART_BYTES,
+            _is_fetchable_art_url,
+        )
+
+        # Same guard as the shared art cache: a remote-supplied thumbnail
+        # URL is untrusted, so reject non-http(s) (file:// / data:) before it
+        # reaches QNAM, and treat a bad URL as "no art".
+        if not track.thumbnail or not _is_fetchable_art_url(track.thumbnail):
             self.art.setImage(None)
             self._art_for_video_id = None
             return
         self._art_for_video_id = track.video_id
 
         req = QNetworkRequest(QUrl(track.thumbnail))
+        req.setTransferTimeout(ART_TRANSFER_TIMEOUT_MS)
         reply = self._net.get(req)
         target_video_id = track.video_id
+
+        def on_progress(received: int, _total: int) -> None:
+            if received > MAX_ART_BYTES:
+                reply.abort()
 
         def on_finished():
             try:
@@ -1632,10 +1755,13 @@ class MainWindow(QMainWindow):
             reply.deleteLater()
             if self._art_for_video_id != target_video_id:
                 return
+            if len(data) > MAX_ART_BYTES:
+                return
             img = QImage()
             if img.loadFromData(data):
                 self.art.setImage(img)
 
+        reply.downloadProgress.connect(on_progress)
         reply.finished.connect(on_finished)
 
     # ---------- player state ----------
@@ -1729,6 +1855,12 @@ class MainWindow(QMainWindow):
 
     def _on_player_error(self, msg: str) -> None:
         self._loading.cancel()
+        # The failing URL may have come from the prefetch cache (stale CDN
+        # signature, expired session). Drop it so retry/next-attempt does a
+        # fresh resolve instead of replaying the same dead URL until TTL.
+        cur = self._current
+        if cur is not None and getattr(cur, "video_id", ""):
+            self._prefetch.invalidate(cur.video_id)
         self.statusBar().showMessage(f"player error: {msg}")
 
     # ---------- theme + shortcuts ----------
@@ -2331,6 +2463,13 @@ class MainWindow(QMainWindow):
                 self.resize(1100, 720)
 
     def open_settings(self) -> None:
+        # Defer the modal past the click handler — opening a QDialog directly
+        # inside the button's clicked emission segfaults on PySide6 + py3.14
+        # (see [[feedback-pyside-modal]]). singleShot(0) with self as receiver
+        # marshals onto this (GUI) thread's event loop.
+        QTimer.singleShot(0, self._do_open_settings)
+
+    def _do_open_settings(self) -> None:
         from .settings import SettingsDialog
         current = getattr(self, "_settings", None)
         if current is None:
@@ -2339,11 +2478,15 @@ class MainWindow(QMainWindow):
             current = settings_module.load()
         dlg = SettingsDialog(current, parent=self)
         self._ui_sound("modal_open")
-        result = dlg.exec()
-        self._ui_sound("modal_close")
+        try:
+            result = dlg.exec()
+        finally:
+            self._ui_sound("modal_close")
         if result != dlg.DialogCode.Accepted:
+            dlg.deleteLater()
             return
         new = dlg.updated_settings()
+        dlg.deleteLater()
         self._settings = new
         # Hot-swap the UI sounds master toggle.
         ui_sounds = getattr(self, "ui_sounds", None)
@@ -2353,6 +2496,13 @@ class MainWindow(QMainWindow):
         discord = getattr(self, "_discord", None)
         if discord is not None:
             discord.configure(new.discord_app_id, new.discord_enabled)
+        # Presence lyric feed follows both toggles; disabling emits None,
+        # which clears any lyric already sitting on the profile.
+        lyric_tracker = getattr(self, "_lyric_tracker", None)
+        if lyric_tracker is not None:
+            lyric_tracker.set_enabled(
+                new.discord_enabled and new.discord_lyrics_enabled
+            )
         # Apply audio device override to the visualizer feed (restart if running).
         try:
             self.visualizer_view._set_audio_source(new.audio_device or None)
@@ -2373,7 +2523,13 @@ class MainWindow(QMainWindow):
         from .central_bg import corner_radius as _corner_radius
         if hasattr(self, "central_bg"):
             self.central_bg.set_enabled(new.adaptive_background)
+            self.central_bg.set_style(new.adaptive_background_style or "field")
+            self.central_bg.set_motion(new.motion or "lite")
             self.central_bg.set_radius(_corner_radius(new.corner_style))
+        # Ambient bass-pulse toggle.
+        ambient = getattr(self, "_ambient", None)
+        if ambient is not None:
+            ambient.set_pulse_enabled(new.adaptive_pulse and new.adaptive_background)
         radius_px = _corner_radius(new.corner_style)
         theming.manager().set_user_override(
             "radius", f"{radius_px}px" if radius_px > 0 else None

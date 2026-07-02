@@ -14,6 +14,7 @@ Each source picks its own TTL when calling ``put_stream_url(source, ...)``.
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -38,6 +39,12 @@ _mem: dict[str, dict[str, tuple[str, float]]] = {}
 def _streams_dir() -> Path:
     p = config.CACHE_DIR / "streams"
     p.mkdir(parents=True, exist_ok=True)
+    # Stream URLs are access-granting (CDN links, and historically subsonic
+    # URLs with embedded auth) — keep the whole directory private.
+    try:
+        os.chmod(p, 0o700)
+    except OSError:
+        pass
     return p
 
 
@@ -72,6 +79,10 @@ def _load_disk(source: str) -> dict[str, tuple[str, float]]:
                 return {}
         return {}
     try:
+        os.chmod(path, 0o600)   # tighten files written by older versions
+    except OSError:
+        pass
+    try:
         with open(path, encoding="utf-8") as f:
             raw = json.load(f)
         return {k: (v["url"], float(v["expires_at"])) for k, v in raw.items()}
@@ -83,7 +94,10 @@ def _save_disk(source: str, cache: dict[str, tuple[str, float]]) -> None:
     path = _stream_file(source)
     serializable = {k: {"url": u, "expires_at": exp} for k, (u, exp) in cache.items()}
     tmp = path.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
+    # 0o600 at create time (not chmod-after) so there's no window where the
+    # URLs are world-readable.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(serializable, f)
     tmp.replace(path)
 
@@ -109,6 +123,17 @@ def _ensure_loaded(source: str) -> dict[str, tuple[str, float]]:
 
 
 # ---------- public api ----------
+
+def clear_source(source: str) -> None:
+    """Drop every cached URL for ``source``, in memory and on disk. Called
+    on sign-out / reconfiguration so credential-bearing URLs (subsonic bakes
+    auth into the query string) don't outlive the credentials themselves."""
+    _mem.pop(source, None)
+    try:
+        _stream_file(source).unlink(missing_ok=True)
+    except OSError:
+        pass
+
 
 def get_stream_url(source: str, video_id: str) -> str | None:
     """Return a cached URL for ``video_id`` under ``source`` if still valid."""

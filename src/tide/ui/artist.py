@@ -106,6 +106,13 @@ class ArtistView(QWidget):
         self.description_label.setWordWrap(True)
         self.description_label.setMaximumHeight(96)
 
+        # Remote artist metadata (name + description) — force PlainText so a
+        # crafted name/bio can't inject HTML/rich text or a file:// image
+        # probe into these AutoText labels. The heading also embeds the
+        # remote artist name (see _line_heading calls below).
+        for _lbl in (self.heading, self.name_label, self.subs_label, self.description_label):
+            _lbl.setTextFormat(Qt.PlainText)
+
         meta = QVBoxLayout()
         meta.setSpacing(4)
         meta.addWidget(self.name_label)

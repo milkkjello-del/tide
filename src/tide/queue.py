@@ -33,6 +33,11 @@ class Queue(QAbstractListModel):
     current_changed = Signal(object)        # Track or None
     refill_requested = Signal(str, list)    # seed_video_id, exclude_ids — UI runs the network
     radio_state_changed = Signal(bool)
+    # The currently-playing row was removed. Payload is the track that took
+    # its slot and should start playing now (skip-to-next), or None when
+    # there's nothing to advance to and playback should stop. The window owns
+    # playback, so it — not the model — decides what to do with the audio.
+    current_removed = Signal(object)        # Track or None
 
     REFILL_TAIL = 3
 
@@ -212,20 +217,41 @@ class Queue(QAbstractListModel):
     def remove(self, row: int) -> None:
         if not (0 <= row < len(self._tracks)):
             return
+        was_current = row == self._current
         self.beginRemoveRows(QModelIndex(), row, row)
         del self._tracks[row]
         self.endRemoveRows()
-        if row < self._current:
-            self._current -= 1
-        elif row == self._current:
-            # The currently-playing row was removed; current pointer now
-            # implicitly refers to the same slot, which is whoever shifted
-            # up (or out-of-bounds if removed from the end).
-            if self._current >= len(self._tracks):
-                self._current = len(self._tracks) - 1
-            if self._current >= 0:
-                self._row_changed(self._current)
+        if not was_current:
+            # Removing something above the current row shifts current down by
+            # one; removing below it leaves the index untouched.
+            if row < self._current:
+                self._current -= 1
+            return
+        # The currently-playing row was removed. Emitting current_changed
+        # alone used to leave the audio and the pointer disagreeing: the
+        # removed track kept playing while the highlight jumped to the next
+        # one, which advance() would then skip. Treat it as a skip instead —
+        # if a track shifted into the slot, that becomes current and the
+        # window plays it; if we removed the last track, stop.
+        if row < len(self._tracks):
+            # A later track shifted up into this slot — make it current.
+            self._current = row
+            self._row_changed(self._current)
             self.current_changed.emit(self.current)
+            self._maybe_refill()
+            self.current_removed.emit(self.current)   # → window plays it
+        elif self._tracks:
+            # Removed the last (and current) track; earlier tracks remain but
+            # there's nothing to advance to. Clamp the pointer and stop.
+            self._current = len(self._tracks) - 1
+            self._row_changed(self._current)
+            self.current_changed.emit(self.current)
+            self.current_removed.emit(None)           # → window stops
+        else:
+            # Queue is now empty.
+            self._current = -1
+            self.current_changed.emit(None)
+            self.current_removed.emit(None)           # → window stops
 
     def move(self, src: int, dst: int) -> None:
         if not (0 <= src < len(self._tracks)) or not (0 <= dst < len(self._tracks)):
@@ -286,6 +312,14 @@ class Queue(QAbstractListModel):
         self._maybe_refill()
 
     def disable_radio(self) -> None:
+        # Always clear the in-flight guard, even if radio was already off.
+        # A refill can be requested and then answered by disable_radio()
+        # instead of absorb_radio() — the window does exactly this when the
+        # active source has no "radio" capability (e.g. double-clicking a
+        # Spotify track with auto-radio on). Without clearing here the guard
+        # stuck True forever and _maybe_refill() never fired again for the
+        # rest of the session, even after switching to a radio-capable source.
+        self._refill_in_flight = False
         if not self._radio_enabled:
             return
         self._radio_enabled = False

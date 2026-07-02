@@ -14,13 +14,14 @@ import time
 from abc import ABC, abstractmethod
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRect, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
     QColor,
     QFont,
     QFontMetrics,
+    QImage,
     QLinearGradient,
     QPainter,
     QPainterPath,
@@ -47,6 +48,33 @@ def _color(theme, key: str, default: str) -> QColor:
     return QColor(theme.token(key, default))
 
 
+def _fill_backdrop(_p: QPainter, _rect: QRect, _color: QColor) -> None:
+    # The app-level CentralBg owns the real backdrop. Visualizer renderers
+    # paint marks on top of it instead of laying down an opaque black panel.
+    return
+
+
+# Physical-pixel cap for the render surface (long side). Above this the canvas
+# renders into a smaller offscreen buffer and upscales — keeps raster cost flat
+# regardless of window size / desktop scaling, which is what made the
+# oscilloscope tank on a large / HiDPI window.
+_RENDER_CAP = 1280
+
+# Repaint cap. The audio feed pushes ~43 frames/s; there's no need to repaint
+# faster than this, and coalescing bursts halves the paint load.
+_RENDER_INTERVAL_MS = 33
+
+
+def _decimate(wave: np.ndarray, target: int) -> np.ndarray:
+    """Down-sample a waveform to ``target`` points by striding (preserves the
+    instantaneous excursions a scope wants, unlike block-averaging)."""
+    n = wave.shape[0]
+    if target >= n:
+        return wave
+    idx = (np.arange(target) * (n / target)).astype(np.intp)
+    return wave[idx]
+
+
 # ---------- renderer strategies ----------
 
 
@@ -69,7 +97,7 @@ class BarsMonoRenderer(Renderer):
         bg = _color(theme, "bg", "#0b0b0b")
         accent = _color(theme, "accent", "#d4b95e")
         dim = _color(theme, "dim", "#444")
-        p.fillRect(rect, bg)
+        _fill_backdrop(p, rect, bg)
         if bands is None:
             return
         n = bands.shape[0]
@@ -114,7 +142,7 @@ class BarsFilledRenderer(Renderer):
         bg = _color(theme, "bg", "#0b0b0b")
         accent = _color(theme, "accent", "#d4b95e")
         fg = _color(theme, "fg", "#e6e6e6")
-        p.fillRect(rect, bg)
+        _fill_backdrop(p, rect, bg)
         if bands is None:
             return
         p.setRenderHint(QPainter.Antialiasing, True)
@@ -144,31 +172,73 @@ class OscilloscopeRenderer(Renderer):
     def paint(self, p, rect, theme, _bands, waveform):
         bg = _color(theme, "bg", "#0b0b0b")
         accent = _color(theme, "accent", "#d4b95e")
-        p.fillRect(rect, bg)
+        _fill_backdrop(p, rect, bg)
+        if waveform is None or waveform.shape[0] < 2:
+            return
+        # Never build more path points than there are output pixels — bounds
+        # both path construction and stroke-rasterization work. (Combined with
+        # the canvas's capped render surface, ``rect`` is itself bounded.)
+        target = int(max(64, min(waveform.shape[0], rect.width() // 2)))
+        wave = _decimate(waveform, target)
+        n = wave.shape[0]
+        p.setRenderHint(QPainter.Antialiasing, True)
+        cx = rect.left()
+        cy = rect.top() + rect.height() / 2.0
+        scale = (rect.height() / 2) * 0.85
+        step = rect.width() / float(n - 1)
+        path = QPainterPath()
+        path.moveTo(cx, cy - float(wave[0]) * scale)
+        for i in range(1, n):
+            path.lineTo(cx + i * step, cy - float(wave[i]) * scale)
+        # One soft halo + one crisp line (was two full-width strokes over the
+        # raw 1024-point path — the halo pen is now thinner, too).
+        halo = QColor(accent)
+        halo.setAlpha(60)
+        p.setPen(QPen(halo, 3.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.drawPath(path)
+        p.setPen(QPen(accent, 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.drawPath(path)
+
+
+class EnvelopeRenderer(Renderer):
+    """Filled min/max waveform envelope. Cost is O(columns) regardless of the
+    sample count or window size, so it stays cheap at any scale."""
+
+    slug = "waveform-envelope"
+    COLS = 256
+
+    def paint(self, p, rect, theme, _bands, waveform):
+        bg = _color(theme, "bg", "#0b0b0b")
+        accent = _color(theme, "accent", "#d4b95e")
+        fg = _color(theme, "fg", "#e6e6e6")
+        _fill_backdrop(p, rect, bg)
         if waveform is None or waveform.shape[0] < 2:
             return
         p.setRenderHint(QPainter.Antialiasing, True)
-        n = waveform.shape[0]
-        cx = rect.left()
-        cy = rect.top() + rect.height() // 2
-        # Pre-build the path so the stroke is one call.
+        cols = min(self.COLS, waveform.shape[0])
+        k = max(1, waveform.shape[0] // cols)
+        cols = waveform.shape[0] // k
+        # Vectorized per-column min/max over contiguous sample groups.
+        block = waveform[: cols * k].reshape(cols, k)
+        maxs = block.max(axis=1)
+        mins = block.min(axis=1)
+        cy = rect.top() + rect.height() / 2.0
+        scale = (rect.height() / 2) * 0.9
+        col_w = rect.width() / float(cols)
         path = QPainterPath()
-        # Center-amplitude scale; clamp to a fraction of the height.
-        scale = (rect.height() / 2) * 0.85
-        step = rect.width() / float(n - 1)
-        path.moveTo(cx, cy - waveform[0] * scale)
-        for i in range(1, n):
-            x = cx + i * step
-            y = cy - float(waveform[i]) * scale
-            path.lineTo(x, y)
-        # Soft halo behind the main stroke.
-        halo = QColor(accent)
-        halo.setAlpha(70)
-        pen = QPen(halo, 4.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-        p.setPen(pen)
-        p.drawPath(path)
-        main = QPen(accent, 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-        p.setPen(main)
+        path.moveTo(rect.left(), cy - float(maxs[0]) * scale)
+        for i in range(1, cols):
+            path.lineTo(rect.left() + i * col_w, cy - float(maxs[i]) * scale)
+        for i in range(cols - 1, -1, -1):
+            path.lineTo(rect.left() + i * col_w, cy - float(mins[i]) * scale)
+        path.closeSubpath()
+        grad = QLinearGradient(QPointF(rect.left(), rect.top()),
+                               QPointF(rect.left(), rect.bottom()))
+        grad.setColorAt(0.0, fg)
+        grad.setColorAt(0.5, accent)
+        grad.setColorAt(1.0, fg)
+        p.setPen(Qt.NoPen)
+        p.setBrush(grad)
         p.drawPath(path)
 
 
@@ -183,7 +253,7 @@ class CircleBurstRenderer(Renderer):
         accent = _color(theme, "accent", "#d4b95e")
         fg = _color(theme, "fg", "#e6e6e6")
         dim = _color(theme, "dim", "#444")
-        p.fillRect(rect, bg)
+        _fill_backdrop(p, rect, bg)
         if bands is None:
             return
         p.setRenderHint(QPainter.Antialiasing, True)
@@ -224,7 +294,7 @@ class MirrorBarsRenderer(Renderer):
         bg = _color(theme, "bg", "#0b0b0b")
         accent = _color(theme, "accent", "#d4b95e")
         dim = _color(theme, "dim", "#444")
-        p.fillRect(rect, bg)
+        _fill_backdrop(p, rect, bg)
         if bands is None:
             return
         p.setRenderHint(QPainter.Antialiasing, True)
@@ -265,7 +335,7 @@ class DotMatrixRenderer(Renderer):
         bg = _color(theme, "bg", "#0b0b0b")
         accent = _color(theme, "accent", "#d4b95e")
         dim = _color(theme, "dim", "#222")
-        p.fillRect(rect, bg)
+        _fill_backdrop(p, rect, bg)
         if bands is None:
             return
         cols = bands.shape[0]
@@ -308,7 +378,7 @@ class StarfieldRenderer(Renderer):
         bg = _color(theme, "bg", "#0b0b0b")
         accent = _color(theme, "accent", "#d4b95e")
         fg = _color(theme, "fg", "#e6e6e6")
-        p.fillRect(rect, bg)
+        _fill_backdrop(p, rect, bg)
         if bands is None:
             return
         import numpy as np
@@ -378,7 +448,7 @@ class MatrixRainRenderer(Renderer):
         dim = _color(theme, "dim", "#007733")
         # Trail fade: paint a translucent bg rect over the previous frame for
         # the persistence effect.
-        p.fillRect(rect, QColor(bg.red(), bg.green(), bg.blue(), 60))
+        p.fillRect(rect, QColor(bg.red(), bg.green(), bg.blue(), 28))
         if bands is None:
             return
         font = QFont(theme.t("typography", "family", "monospace") if theme else "monospace")
@@ -428,7 +498,7 @@ class NeonGridRenderer(Renderer):
         accent = _color(theme, "accent", "#ff5dff")
         accent_alt = _color(theme, "accent_alt", "#5dfdff")
         fg = _color(theme, "fg", "#f0e8ff")
-        p.fillRect(rect, bg)
+        _fill_backdrop(p, rect, bg)
         p.setRenderHint(QPainter.Antialiasing, True)
 
         # Horizon at ~55% down — gives the grid the right perspective feel.
@@ -498,6 +568,7 @@ _RENDERERS: dict[str, Renderer] = {
     BarsMonoRenderer.slug: BarsMonoRenderer(),
     BarsFilledRenderer.slug: BarsFilledRenderer(),
     OscilloscopeRenderer.slug: OscilloscopeRenderer(),
+    EnvelopeRenderer.slug: EnvelopeRenderer(),
     NeonGridRenderer.slug: NeonGridRenderer(),
     CircleBurstRenderer.slug: CircleBurstRenderer(),
     MirrorBarsRenderer.slug: MirrorBarsRenderer(),
@@ -541,9 +612,31 @@ class _Canvas(QWidget):
         self._renderer = renderer_for_theme(self._theme)
         self._bands: np.ndarray | None = None
         self._waveform: np.ndarray | None = None
+        self._dirty = False
+        self._buf: QImage | None = None
+        # Repaints are driven by this timer, not by every audio callback, so
+        # the ~43 fps feed is coalesced to a bounded repaint rate.
+        self._render_timer = QTimer(self)
+        self._render_timer.setInterval(_RENDER_INTERVAL_MS)
+        self._render_timer.timeout.connect(self._on_render_tick)
         theming.manager().theme_changed.connect(self._on_theme)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setAttribute(Qt.WA_OpaquePaintEvent)
+        self.setAttribute(Qt.WA_OpaquePaintEvent, False)
+        self.setAutoFillBackground(False)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._render_timer.isActive():
+            self._render_timer.start()
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        self._render_timer.stop()
+
+    def _on_render_tick(self) -> None:
+        if self._dirty and self.isVisible():
+            self._dirty = False
+            self.update()
 
     def _on_theme(self, theme) -> None:
         self._theme = theme
@@ -566,18 +659,39 @@ class _Canvas(QWidget):
 
     def update_bands(self, bands: np.ndarray) -> None:
         self._bands = bands
-        self.update()
+        self._dirty = True
 
     def update_waveform(self, wave: np.ndarray) -> None:
         self._waveform = wave
-        # Oscilloscope wants per-waveform repaint; bars already update via bands_updated.
-        if isinstance(self._renderer, OscilloscopeRenderer):
-            self.update()
+        self._dirty = True
 
     def paintEvent(self, _ev) -> None:
-        p = QPainter(self)
-        p.setRenderHint(QPainter.TextAntialiasing, True)
-        self._renderer.paint(p, self.rect(), self._theme, self._bands, self._waveform)
+        rect = self.rect()
+        dpr = self.devicePixelRatioF()
+        long_px = max(rect.width(), rect.height()) * dpr
+        if long_px > _RENDER_CAP:
+            # Render into a capped offscreen buffer, then upscale-blit. Bounds
+            # the renderer's working resolution on large / HiDPI surfaces.
+            s = _RENDER_CAP / long_px
+            bw = max(1, int(round(rect.width() * dpr * s)))
+            bh = max(1, int(round(rect.height() * dpr * s)))
+            if self._buf is None or self._buf.width() != bw or self._buf.height() != bh:
+                self._buf = QImage(bw, bh, QImage.Format_ARGB32_Premultiplied)
+            self._buf.fill(Qt.transparent)
+            bp = QPainter(self._buf)
+            bp.setRenderHint(QPainter.TextAntialiasing, True)
+            self._renderer.paint(bp, QRect(0, 0, bw, bh), self._theme,
+                                 self._bands, self._waveform)
+            bp.end()
+            p = QPainter(self)
+            p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            p.drawImage(rect, self._buf)
+            p.end()
+        else:
+            p = QPainter(self)
+            p.setRenderHint(QPainter.TextAntialiasing, True)
+            self._renderer.paint(p, rect, self._theme, self._bands, self._waveform)
+            p.end()
 
 
 class VisualizerView(QWidget):
@@ -589,6 +703,10 @@ class VisualizerView(QWidget):
         self._feed.bands_updated.connect(self._on_bands)
         self._feed.waveform_updated.connect(self._on_waveform)
         self._feed.error.connect(self._on_error)
+        # Local view-capturing flag. The feed is refcounted and may also be
+        # held by the ambient bass-pulse, so ``feed.running`` no longer maps
+        # 1:1 to "this view is displaying" — track our own membership.
+        self._capturing = False
 
         self._canvas = _Canvas(self)
         self._theme = theming.manager().current()
@@ -600,7 +718,7 @@ class VisualizerView(QWidget):
         self._heading.setProperty("class", "dim")
         self._heading.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        self._toggle_btn = BracketButton("start" if not self._feed.running else "stop")
+        self._toggle_btn = BracketButton("start")
         self._toggle_btn.clicked.connect(self._on_toggle)
 
         self._fullscreen_btn = BracketButton("fullscreen")
@@ -724,11 +842,10 @@ class VisualizerView(QWidget):
             settings_module.save(s)
         except Exception:
             pass
-        # Restart the feed if it's already running so the change takes effect.
+        # Restart the shared capture on the new device if it's live (this
+        # keeps all consumers, e.g. the ambient pulse, attached).
         if self._feed.running:
-            self._feed.stop()
-            self._toggle_btn.setLabel("start")
-            self._start_capture()
+            self._feed.set_source(name or None)
         self._refresh_cog_menu()
 
     def _position_cog(self) -> None:
@@ -746,7 +863,7 @@ class VisualizerView(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        if not self._feed.running:
+        if not self._capturing:
             self._start_capture()
 
     def hideEvent(self, event) -> None:
@@ -756,13 +873,15 @@ class VisualizerView(QWidget):
         # the [stop] button or the settings toggle.
 
     def teardown(self) -> None:
-        self._feed.stop()
+        self._feed.remove_consumer("visualizer")
+        self._capturing = False
         self._toggle_btn.setLabel("start")
 
     # ---------- actions ----------
 
     def _start_capture(self) -> None:
-        ok = self._feed.start(source=self._audio_source_override)
+        ok = self._feed.add_consumer("visualizer", source=self._audio_source_override)
+        self._capturing = bool(ok)
         if ok:
             self._toggle_btn.setLabel("stop")
             self.status_message.emit(theming.styled_case(f"visualizer · capturing from {self._feed.device}"))
@@ -771,8 +890,9 @@ class VisualizerView(QWidget):
             self.status_message.emit(theming.styled_case("visualizer · no audio device"))
 
     def _on_toggle(self) -> None:
-        if self._feed.running:
-            self._feed.stop()
+        if self._capturing:
+            self._feed.remove_consumer("visualizer")
+            self._capturing = False
             self._toggle_btn.setLabel("start")
             self.status_message.emit(theming.styled_case("visualizer · stopped"))
         else:
@@ -796,11 +916,13 @@ class VisualizerView(QWidget):
     # ---------- feed signals (GUI thread) ----------
 
     def _on_bands(self, bands: np.ndarray) -> None:
-        if self._canvas.isVisible():
+        # Only when this view is actively capturing (not merely because the
+        # ambient pulse is holding the shared feed) and on screen.
+        if self._capturing and self._canvas.isVisible():
             self._canvas.update_bands(bands)
 
     def _on_waveform(self, wave: np.ndarray) -> None:
-        if self._canvas.isVisible():
+        if self._capturing and self._canvas.isVisible():
             self._canvas.update_waveform(wave)
 
     def _on_error(self, msg: str) -> None:

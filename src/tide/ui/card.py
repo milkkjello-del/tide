@@ -169,14 +169,20 @@ class ShelfRow(QScrollArea):
         self.setFrameShape(QScrollArea.NoFrame)
         self._apply_scaled_height()
         # Theme re-emit also fires on ui_scale change, so this is how we
-        # pick up live scale updates without a dedicated channel.
-        theming.manager().theme_changed.connect(lambda _t: self._apply_scaled_height())
+        # pick up live scale updates without a dedicated channel. Must be a
+        # bound method: a lambda connected to the app-lifetime theming
+        # manager never disconnects, so every discarded ShelfRow would keep
+        # being invoked on dead C++ objects at each theme change.
+        theming.manager().theme_changed.connect(self._on_theme_rescale)
 
         self._inner = QWidget()
         self._layout = QHBoxLayout(self._inner)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(8)
         self.setWidget(self._inner)
+
+    def _on_theme_rescale(self, _theme) -> None:
+        self._apply_scaled_height()
 
     def _apply_scaled_height(self) -> None:
         from . import scale as _scale

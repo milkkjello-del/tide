@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..settings import Settings
-from ..sources import MusicSource, registry as source_registry
+from ..sources import MusicSource, NotSupportedError, registry as source_registry
 from ..theming import styled_case
 
 
@@ -319,6 +319,11 @@ class SourcePanel(QWidget):
     enabled_changed = Signal(str, bool)
     settings_changed = Signal()              # ask host to persist + relayout
     local_dir_changed = Signal(str)          # for LocalSource rescan trigger
+    # Emitted from pool threads when a background probe finishes; the queued
+    # delivery marshals the row repaint onto the GUI thread. (The previous
+    # QTimer.singleShot-from-a-pool-thread approach silently never fires for
+    # plain callables — no event loop on QThreadPool threads.)
+    _probe_done = Signal(str)                # slug
 
     def __init__(self, settings: Settings, parent=None) -> None:
         super().__init__(parent)
@@ -326,6 +331,7 @@ class SourcePanel(QWidget):
         self._rows: dict[str, _SourceRow] = {}
         self._active_group = QButtonGroup(self)
         self._active_group.setExclusive(True)
+        self._probe_done.connect(self._on_probe_done)
 
         heading = QLabel(styled_case("source"))
         heading.setObjectName("sectionHeading")
@@ -400,26 +406,38 @@ class SourcePanel(QWidget):
 
     def _on_row_enable(self, slug: str, enabled: bool) -> None:
         self._ui_sound("toggle_on" if enabled else "toggle_off")
-        # Gate Spotify behind the shelved-state warning. If the user
-        # backs out, roll the row's checkbox back to off without
-        # touching the registry or persisting settings.
+        # Any path that opens a modal (Spotify confirm, Subsonic connect form)
+        # MUST defer past this toggled emission — opening a QDialog inside a
+        # QCheckBox's signal segfaults on PySide6 + py3.14 (the crash the
+        # onboarding code already guards against). The checkbox is visually ON
+        # for one event-loop tick; the deferred gate rolls it back if the user
+        # declines. See [[feedback-pyside-modal]].
         if slug == "spotify" and enabled:
-            from .spotify_signin import confirm_spotify_enable
-            if not confirm_spotify_enable(self):
-                row = self._rows.get(slug)
-                if row is not None:
-                    row.set_enabled_state(False)
-                return
-        # Subsonic needs a server URL + credentials before it's useful.
-        # Toggling it on with empty config opens the connect dialog and
-        # rolls back the checkbox if the user cancels — otherwise enabling
-        # the source would leave the row visible but every call would no-op.
+            QTimer.singleShot(0, lambda: self._gate_enable(slug, self._confirm_spotify))
+            return
+        # Subsonic needs a server URL + credentials before it's useful; toggling
+        # it on with empty config opens the connect dialog.
         if slug == "subsonic" and enabled and not self._subsonic_configured():
-            if not self._run_subsonic_setup():
-                row = self._rows.get(slug)
-                if row is not None:
-                    row.set_enabled_state(False)
-                return
+            QTimer.singleShot(0, lambda: self._gate_enable(slug, self._run_subsonic_setup))
+            return
+        self._commit_enable(slug, enabled)
+
+    def _confirm_spotify(self) -> bool:
+        from .spotify_signin import confirm_spotify_enable
+        return bool(confirm_spotify_enable(self))
+
+    def _gate_enable(self, slug: str, gate) -> None:
+        """Run a (possibly modal) confirmation ``gate`` for enabling ``slug``,
+        deferred out of the originating click/toggle. Commit on success; roll
+        the row's checkbox back to off on cancel."""
+        if gate():
+            self._commit_enable(slug, True)
+        else:
+            row = self._rows.get(slug)
+            if row is not None:
+                row.set_enabled_state(False)
+
+    def _commit_enable(self, slug: str, enabled: bool) -> None:
         reg = source_registry()
         reg.set_enabled(slug, enabled)
         self._settings.sources_enabled[slug] = enabled
@@ -431,24 +449,31 @@ class SourcePanel(QWidget):
 
     def _on_row_activate(self, slug: str) -> None:
         reg = source_registry()
-        # Make-active also enables; gate Spotify behind the same warning
-        # so users can't end up with it as the default active source
-        # without acknowledging the shelved state first.
+        # Make-active also enables; gate Spotify/Subsonic behind their setup
+        # modals. Same defer-out-of-the-toggle rule as _on_row_enable — the
+        # radio is visually selected for one tick and rolled back on cancel.
         if slug == "spotify" and not reg.is_enabled(slug):
-            from .spotify_signin import confirm_spotify_enable
-            if not confirm_spotify_enable(self):
-                row = self._rows.get(slug)
-                if row is not None:
-                    row.set_active_state(False)
-                return
+            QTimer.singleShot(0, lambda: self._gate_activate(slug, self._confirm_spotify))
+            return
         # Same gate for Subsonic — make-active implies enable, but if
         # the source isn't configured there's nothing to make active.
         if slug == "subsonic" and not self._subsonic_configured():
-            if not self._run_subsonic_setup():
-                row = self._rows.get(slug)
-                if row is not None:
-                    row.set_active_state(False)
-                return
+            QTimer.singleShot(0, lambda: self._gate_activate(slug, self._run_subsonic_setup))
+            return
+        self._commit_activate(slug)
+
+    def _gate_activate(self, slug: str, gate) -> None:
+        """Deferred (possibly modal) gate for making ``slug`` active; roll the
+        row's radio back on cancel."""
+        if gate():
+            self._commit_activate(slug)
+        else:
+            row = self._rows.get(slug)
+            if row is not None:
+                row.set_active_state(False)
+
+    def _commit_activate(self, slug: str) -> None:
+        reg = source_registry()
         if not reg.is_enabled(slug):
             reg.set_enabled(slug, True)
             self._settings.sources_enabled[slug] = True
@@ -468,6 +493,11 @@ class SourcePanel(QWidget):
         self.settings_changed.emit()
 
     def _on_row_gear(self, slug: str) -> None:
+        # Defer the modal past the gear button's click emission (PySide6 +
+        # py3.14 segfault guard, see [[feedback-pyside-modal]]).
+        QTimer.singleShot(0, lambda: self._do_row_gear(slug))
+
+    def _do_row_gear(self, slug: str) -> None:
         if slug == "local":
             self._configure_local()
             return
@@ -481,7 +511,10 @@ class SourcePanel(QWidget):
         dlg = _GenericSourceDialog(source, self)
         dlg.sign_out_requested.connect(self._sign_out_source)
         dlg.sign_in_requested.connect(self._sign_in_source)
-        dlg.exec()
+        try:
+            dlg.exec()
+        finally:
+            dlg.deleteLater()
 
     def _sign_out_source(self, slug: str) -> None:
         reg = source_registry()
@@ -501,13 +534,31 @@ class SourcePanel(QWidget):
         """Run the source's in-app auth (the import wizard for YT Music) and,
         on success, re-enable + activate it so it's usable immediately. This
         is the recovery path that was missing — signing out used to be a
-        one-way trip with no way back in short of restarting tide."""
+        one-way trip with no way back in short of restarting tide.
+
+        Deferred: this fires from the gear dialog's [sign in] button emission,
+        so opening the wizard inline would be a nested modal-from-click. The
+        singleShot lets the gear dialog finish closing first."""
+        QTimer.singleShot(0, lambda: self.reauth_source(slug))
+
+    def reauth_source(self, slug: str) -> bool:
+        """Public re-auth entry point: run ``slug``'s in-app sign-in flow and
+        rewire enable/persist/row state on success. Shared by the gear
+        dialog's [sign in] button and the session-expired toast action.
+        Returns True iff auth now exists."""
         reg = source_registry()
         source = reg.get(slug)
         if source is None:
-            return
+            return False
         try:
             ok = bool(source.begin_auth(self))
+        except NotSupportedError:
+            # Bespoke-flow sources (Spotify OAuth, Subsonic server form)
+            # sign in from their gear dialog rather than a generic
+            # begin_auth — open that instead so the session-expired
+            # toast's [sign in] still lands somewhere useful.
+            self._do_row_gear(slug)
+            ok = bool(source.is_authenticated())
         except Exception:
             ok = False
         if ok:
@@ -519,35 +570,54 @@ class SourcePanel(QWidget):
             row.refresh_status()
             row.set_enabled_state(reg.is_enabled(slug))
             row._refresh_dot(reg.is_enabled(slug))
+        return ok
 
     # ---------- subsonic ----------
 
     def _probe_async_sources(self) -> None:
-        """Kick off non-blocking probes for sources whose connection
-        state depends on a network call. Currently Subsonic only — the
-        others either check local state (local files, ytmusic cookie) or
-        are fast in-process token checks (spotify)."""
-        from ..sources.subsonic import SubsonicSource
+        """Kick off non-blocking probes for sources whose status line
+        depends on a network call — Subsonic's ping and Spotify's /me
+        profile — so status_text() itself stays free of blocking I/O on
+        the GUI thread."""
         reg = source_registry()
-        source = reg.get("subsonic")
-        if not isinstance(source, SubsonicSource):
-            return
-        if not self._subsonic_configured():
+        jobs: list[tuple[str, object]] = []
+
+        sub = reg.get("subsonic")
+        if sub is not None and self._subsonic_configured():
+            jobs.append(("subsonic", sub))
+        sp = reg.get("spotify")
+        if sp is not None and hasattr(sp, "probe"):
+            try:
+                if sp.is_authenticated():
+                    jobs.append(("spotify", sp))
+            except Exception:
+                pass
+        if not jobs:
             return
 
         panel = self
 
         class _Job(QRunnable):
+            def __init__(self_inner, slug: str, source) -> None:
+                super().__init__()
+                self_inner.slug = slug
+                self_inner.source = source
+
             def run(self_inner):
                 try:
-                    source.probe()
+                    self_inner.source.probe()
                 except Exception:
                     pass
-                # Marshal the row refresh back to the GUI thread.
-                QTimer.singleShot(0, panel.refresh_statuses)
-                QTimer.singleShot(0, lambda: panel._refresh_dot_for("subsonic"))
+                # Queued signal — the only reliable way to reach the GUI
+                # thread from a pool thread.
+                panel._probe_done.emit(self_inner.slug)
 
-        QThreadPool.globalInstance().start(_Job())
+        for slug, source in jobs:
+            QThreadPool.globalInstance().start(_Job(slug, source))
+
+    def _on_probe_done(self, slug: str) -> None:
+        self.refresh_statuses()
+        self._refresh_dot_for(slug)
 
     def _refresh_dot_for(self, slug: str) -> None:
         row = self._rows.get(slug)

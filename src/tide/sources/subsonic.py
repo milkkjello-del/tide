@@ -45,6 +45,7 @@ from .base import (
     ShelfItem,
     StreamRef,
     Track,
+    safe_int,
 )
 
 
@@ -55,6 +56,10 @@ SOURCE_SLUG = "subsonic"
 API_VERSION = "1.16.1"
 CLIENT_NAME = "tide"
 TIMEOUT_SECONDS = 10.0
+# Cap the response body a (possibly plain-HTTP, least-trusted) Subsonic
+# server can push at us, so a malicious/MITM'd server can't exhaust memory
+# with a multi-GB body. Generous enough for any real library JSON page.
+MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 
 
 def _seconds_to_hms(secs: int) -> str:
@@ -105,14 +110,17 @@ class SubsonicSource(MusicSource):
         "library", "albums", "artists", "home", "radio", "rating",
     })
 
-    # Stream URLs are query-string authed and don't carry any TTL we
-    # have to honor; the server validates on every connection. Cache
-    # them aggressively for the session so resolve_stream doesn't churn.
-    STREAM_TTL_SECONDS = 12 * 3600
-
     def __init__(self, config: SubsonicConfig) -> None:
         self._cfg = config
         self._url = _normalize_url(config.url)
+        # Older tide versions persisted credentialed stream URLs to the
+        # shared disk cache (auth token in the query string, world-readable,
+        # surviving sign-out). We never write them anymore — see
+        # resolve_stream — so purge whatever an earlier version left behind.
+        try:
+            cache.clear_source(SOURCE_SLUG)
+        except Exception:
+            pass
         # Quick probe state — populated by the first call to a method
         # that does any IO. status_text() consumes it to render the
         # "signed in as X" / "can't reach server" line in the source
@@ -129,6 +137,13 @@ class SubsonicSource(MusicSource):
         self._url = _normalize_url(config.url)
         self._reachable = None
         self._reachable_error = ""
+        # Any cached URLs were minted with the old server/credentials —
+        # invalid at best, a leaked credential at worst (sign_out routes
+        # through here with an empty config).
+        try:
+            cache.clear_source(SOURCE_SLUG)
+        except Exception:
+            pass
 
     def sign_out(self) -> None:
         """Wipe credentials in-memory. The settings file still holds them
@@ -187,7 +202,14 @@ class SubsonicSource(MusicSource):
             "c": CLIENT_NAME,
             "f": "json",
         }
-        if self._cfg.auth_style == "plain":
+        # Plain auth (?p=<cleartext>) is only safe over TLS — otherwise the
+        # account password crosses the wire (and lands in server/proxy access
+        # logs) in the clear. The "plain (https only)" label was never
+        # enforced, so refuse to honor it over http: fall back to salt+token,
+        # which authenticates against any Subsonic server without ever
+        # transmitting the cleartext password. Over https, plain is respected.
+        use_plain = self._cfg.auth_style == "plain" and self._url.lower().startswith("https://")
+        if use_plain:
             params["p"] = self._cfg.password
         else:
             salt = secrets.token_hex(8)
@@ -204,18 +226,46 @@ class SubsonicSource(MusicSource):
         merged = {**self._auth_params(), **({k: v for k, v in (params or {}).items() if v is not None})}
         url = f"{self._url}/rest/{endpoint}.view?" + urllib.parse.urlencode(merged)
         req = urllib.request.Request(url, headers={"User-Agent": "tide/1.2.1"})
-        with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+                raw = resp.read(MAX_RESPONSE_BYTES).decode("utf-8", errors="replace")
+        except Exception as exc:
+            # Transport failure — the server is gone as far as the UI cares.
+            # Record it so status_text()/is_authenticated() stop claiming
+            # "signed in as X"; the next successful call heals the state.
+            self._reachable = False
+            self._reachable_error = str(exc)
+            raise RuntimeError(f"subsonic: can't reach server: {exc}") from exc
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
+            self._reachable = False
+            self._reachable_error = f"non-json response from {endpoint}"
             raise RuntimeError(f"subsonic: non-json response from {endpoint}: {exc}")
-        envelope = (data.get("subsonic-response") or {})
+        # Well-formed JSON of the wrong *shape* (a list/number/string at the
+        # top level, or a non-dict envelope) would otherwise raise an
+        # AttributeError out of the worker thread on the .get() calls below.
+        # A malicious/MITM'd server can send that trivially, so treat any
+        # unexpected shape as a protocol error rather than crashing.
+        if not isinstance(data, dict):
+            raise RuntimeError(f"subsonic: malformed response from {endpoint}")
+        envelope = data.get("subsonic-response")
+        if not isinstance(envelope, dict):
+            raise RuntimeError(f"subsonic: malformed response from {endpoint}")
         status = envelope.get("status")
         if status != "ok":
             err = envelope.get("error") or {}
             msg = err.get("message") or f"endpoint {endpoint} returned {status!r}"
+            # Codes 40/41 are credential rejections — those poison the whole
+            # source. Anything else (unsupported endpoint, bad id, …) is a
+            # per-request problem and must NOT mark the server unhealthy:
+            # get_artist probes optional endpoints that many servers lack.
+            if str(err.get("code")) in ("40", "41"):
+                self._reachable = False
+                self._reachable_error = msg
             raise RuntimeError(f"subsonic: {msg}")
+        self._reachable = True
+        self._reachable_error = ""
         return envelope
 
     def _stream_url(self, song_id: str) -> str:
@@ -231,12 +281,18 @@ class SubsonicSource(MusicSource):
     # ---------- conversion helpers ----------
 
     def _to_track(self, item: dict | None) -> Track | None:
-        if not item:
+        # Reject non-dict input up front. Subsonic sometimes returns a bare
+        # object where a list is expected (or a malicious server sends the
+        # wrong shape entirely); the callers iterate `.get("song")` blindly,
+        # and iterating a dict/str yields keys/chars. Guarding here means
+        # every one of those loops degrades to "skip" instead of raising an
+        # AttributeError out of the worker thread.
+        if not isinstance(item, dict):
             return None
         tid = item.get("id") or ""
         if not tid:
             return None
-        secs = int(item.get("duration") or 0)
+        secs = safe_int(item.get("duration"))
         return Track(
             video_id=tid,
             title=item.get("title", "") or "",
@@ -250,6 +306,8 @@ class SubsonicSource(MusicSource):
         )
 
     def _to_album_entry(self, item: dict) -> AlbumEntry | None:
+        if not isinstance(item, dict):
+            return None
         aid = item.get("id") or ""
         if not aid:
             return None
@@ -264,6 +322,8 @@ class SubsonicSource(MusicSource):
         )
 
     def _to_artist_entry(self, item: dict) -> ArtistEntry | None:
+        if not isinstance(item, dict):
+            return None
         cid = item.get("id") or ""
         if not cid:
             return None
@@ -279,10 +339,10 @@ class SubsonicSource(MusicSource):
     def search_songs(self, query: str, limit: int = 20) -> list[Track]:
         if not query.strip():
             return []
-        try:
-            res = self._call("search3", {"query": query, "songCount": limit, "albumCount": 0, "artistCount": 0})
-        except Exception:
-            return []
+        # Errors propagate: the search worker turns them into a visible
+        # "search failed" instead of a silent, lying "no results". _call
+        # has already flipped the health state for status_text().
+        res = self._call("search3", {"query": query, "songCount": limit, "albumCount": 0, "artistCount": 0})
         items = ((res.get("searchResult3") or {}).get("song")) or []
         out: list[Track] = []
         for item in items:
@@ -292,22 +352,19 @@ class SubsonicSource(MusicSource):
         return out
 
     def resolve_stream(self, track: Track) -> StreamRef:
-        cached = cache.get_stream_url(SOURCE_SLUG, track.video_id)
-        if cached:
-            return StreamRef(backend="mpv", payload=cached)
-        url = self._stream_url(track.video_id)
-        cache.put_stream_url(SOURCE_SLUG, track.video_id, url, ttl_seconds=self.STREAM_TTL_SECONDS)
-        return StreamRef(backend="mpv", payload=url)
+        # Built fresh every time, never cached: the URL is pure local
+        # computation (md5 + urlencode, no network), and it embeds the auth
+        # token — in "plain" mode the actual password. Persisting it to the
+        # shared stream cache wrote credentials to disk where they survived
+        # sign-out. Nothing is gained by caching a zero-cost computation.
+        return StreamRef(backend="mpv", payload=self._stream_url(track.video_id))
 
     # ---------- search filters ----------
 
     def search_albums(self, query: str, limit: int = 20) -> list[AlbumEntry]:
         if not query.strip():
             return []
-        try:
-            res = self._call("search3", {"query": query, "albumCount": limit, "songCount": 0, "artistCount": 0})
-        except Exception:
-            return []
+        res = self._call("search3", {"query": query, "albumCount": limit, "songCount": 0, "artistCount": 0})
         items = ((res.get("searchResult3") or {}).get("album")) or []
         out: list[AlbumEntry] = []
         for item in items:
@@ -319,10 +376,7 @@ class SubsonicSource(MusicSource):
     def search_artists(self, query: str, limit: int = 20) -> list[ArtistEntry]:
         if not query.strip():
             return []
-        try:
-            res = self._call("search3", {"query": query, "artistCount": limit, "songCount": 0, "albumCount": 0})
-        except Exception:
-            return []
+        res = self._call("search3", {"query": query, "artistCount": limit, "songCount": 0, "albumCount": 0})
         items = ((res.get("searchResult3") or {}).get("artist")) or []
         out: list[ArtistEntry] = []
         for item in items:
@@ -334,10 +388,9 @@ class SubsonicSource(MusicSource):
     # ---------- library + playlists ----------
 
     def get_library_playlists(self, limit: int = 100) -> list[PlaylistEntry]:
-        try:
-            res = self._call("getPlaylists")
-        except Exception:
-            return []
+        # Propagates: the library worker shows "library load failed" rather
+        # than rendering an empty library over a dead connection.
+        res = self._call("getPlaylists")
         items = ((res.get("playlists") or {}).get("playlist")) or []
         out: list[PlaylistEntry] = []
         for item in items[:limit]:
@@ -353,10 +406,7 @@ class SubsonicSource(MusicSource):
         return out
 
     def get_playlist(self, playlist_id: str, limit: int = 500) -> PlaylistDetail:
-        try:
-            res = self._call("getPlaylist", {"id": playlist_id})
-        except Exception:
-            return PlaylistDetail(playlist_id=playlist_id, title="", tracks=[])
+        res = self._call("getPlaylist", {"id": playlist_id})
         pl = res.get("playlist") or {}
         tracks: list[Track] = []
         for item in (pl.get("entry") or [])[:limit]:
@@ -393,7 +443,7 @@ class SubsonicSource(MusicSource):
             if not tr.thumbnail:
                 tr.thumbnail = cover
             tracks.append(tr)
-        secs = int(album.get("duration") or 0)
+        secs = safe_int(album.get("duration"))
         return AlbumDetail(
             browse_id=browse_id,
             title=album.get("name", "") or "",

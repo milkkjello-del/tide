@@ -24,6 +24,7 @@ class PlaybackRouter(QObject):
     state_changed = Signal(object)
     position_changed = Signal(float)
     duration_changed = Signal(float)
+    speed_changed = Signal(float)        # playback rate multiplier (1.0 = normal)
     ended = Signal()
     error = Signal(str)
 
@@ -145,12 +146,18 @@ class PlaybackRouter(QObject):
         """Apply to every backend so a speed-change made before a backend
         becomes active still takes effect when it does. Backends that don't
         support speed simply no-op."""
-        self._speed = max(0.25, min(4.0, float(value)))
+        rate = max(0.25, min(4.0, float(value)))
+        changed = rate != self._speed
+        self._speed = rate
         for b in self._backends.values():
             try:
                 b.set_speed(self._speed)
             except Exception:
                 pass
+        # Notify listeners (Discord Rich Presence) so wall-clock progress math
+        # can rescale — the router is the authoritative speed store.
+        if changed:
+            self.speed_changed.emit(self._speed)
 
     @Slot(bool)
     def set_pitch_correction(self, enabled: bool) -> None:
@@ -189,6 +196,10 @@ class PlaybackRouter(QObject):
     @property
     def duration(self) -> float:
         return self._active.duration if self._active is not None else 0.0
+
+    @property
+    def speed(self) -> float:
+        return self._speed
 
     @property
     def active_slug(self) -> str:

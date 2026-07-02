@@ -199,8 +199,12 @@ def run(argv: list[str] | None = None) -> int:
                  enabled=user_settings.sources_enabled.get("local", True))
     # v1.2.1 — Spotify. Registers only if (a) spotipy is installed, and
     # (b) the user has completed sign-in. The sources panel surfaces a
-    # [connect] button otherwise.
-    sp_tokens = auth_spotify.current_tokens() if HAVE_SPOTIPY else None
+    # [connect] button otherwise. saved_tokens() reads the stored grant
+    # WITHOUT refreshing: a refresh here would block the GUI thread on
+    # the network (up to 15s offline), and a failed one used to drop the
+    # source from the panel entirely for the whole session. The access
+    # token refreshes lazily on first actual use, off-thread.
+    sp_tokens = auth_spotify.saved_tokens() if HAVE_SPOTIPY else None
     if sp_tokens is not None and sp_tokens.refresh_token:
         spotify_source = SpotifySource(
             sp_tokens,
@@ -302,6 +306,17 @@ def run(argv: list[str] | None = None) -> int:
     discord.start_wire()
     discord.configure(user_settings.discord_app_id, user_settings.discord_enabled)
 
+    # Live-lyric feed for the presence state line. Headless (not the lyrics
+    # panel) so it keeps working with the panel closed; gated on BOTH
+    # toggles so a disabled feature never fetches lyrics.
+    from .lyric_tracker import LyricTracker
+    lyric_tracker = LyricTracker(api_obj, player, window.queue)
+    lyric_tracker.start_wire()
+    lyric_tracker.lyric_changed.connect(discord.set_lyric)
+    lyric_tracker.set_enabled(
+        user_settings.discord_enabled and user_settings.discord_lyrics_enabled
+    )
+
     # ListenBrainz scrobbling — opt-in via Settings → ListenBrainz.
     from .listenbrainz import ListenBrainzScrobbler
     scrobbler = ListenBrainzScrobbler(player, window.queue)
@@ -312,48 +327,94 @@ def run(argv: list[str] | None = None) -> int:
     from .ui.adaptive import AdaptiveDriver
     adaptive = AdaptiveDriver(window.queue)
     adaptive.set_enabled(user_settings.adaptive_accent)
-    # Also drive bg_alt extraction if the user wants the central-area
-    # gradient. This is independent of the accent shift.
+    # Also drive ambient backdrop extraction if the user wants the adaptive
+    # background. This is independent of the accent shift.
     adaptive.set_background_enabled(user_settings.adaptive_background)
     window._adaptive = adaptive
 
-    # Apply user's central-area + corner preferences. CentralBg paints
-    # gradient + clips corners; corner radius is also pushed as a sticky
+    # Apply user's app-backdrop + corner preferences. CentralBg paints the
+    # adaptive surface and clips corners; corner radius is also pushed as a sticky
     # theming override so widgets that use @radius (inputs, scrollbars)
     # match.
     from .ui.central_bg import corner_radius as _corner_radius
     window.central_bg.set_enabled(user_settings.adaptive_background)
+    window.central_bg.set_style(user_settings.adaptive_background_style or "field")
+    window.central_bg.set_motion(user_settings.motion or "lite")
     radius_px = _corner_radius(user_settings.corner_style)
     window.central_bg.set_radius(radius_px)
     if radius_px > 0:
         theming.manager().set_user_override("radius", f"{radius_px}px")
+
+    # Ambient bass-pulse — drives the central gradient's swell from the audio
+    # monitor while playing. App-wide, gated by the adaptive_pulse setting.
+    from .ui.ambient import AmbientController
+    ambient = AmbientController(player, window.central_bg)
+    ambient.set_pulse_enabled(
+        user_settings.adaptive_pulse and user_settings.adaptive_background
+    )
+    window._ambient = ambient
+
     # Nav-rail icons (per the user's nav_icon_set preference).
     window.apply_nav_icons(user_settings.nav_icon_set or "off")
 
+    # Cookie-death probe. Imported YT Music cookies expire silently: every
+    # API call starts 401ing and the views above just render empty, so the
+    # user's first hint was "the app feels broken". Fire one cheap
+    # authenticated round-trip in the background; if it comes back
+    # unauthenticated the source reports through the registry and the window
+    # raises the "session expired → [sign in]" toast within seconds of
+    # launch. Network blips raise non-auth errors and are ignored — never
+    # sign anyone out over a dead wifi link.
+    if yt_source is not None and reg.is_enabled("ytmusic"):
+        from PySide6.QtCore import QRunnable, QThreadPool
+
+        class _YtAuthProbe(QRunnable):
+            def run(self_inner) -> None:
+                try:
+                    yt_source.probe_auth()
+                except Exception:
+                    pass
+
+        QThreadPool.globalInstance().start(_YtAuthProbe())
+
     # Once-a-day update check.
-    from PySide6.QtCore import QMetaObject, Qt, Q_ARG
     from PySide6.QtGui import QDesktopServices
     from PySide6.QtCore import QUrl as _QUrl
     from . import __version__, updates
     from .ui.toast import show_toast
 
-    def _on_newer(tag: str, url: str) -> None:
-        # Cross-thread → marshal to GUI thread via QTimer.singleShot(0, ...).
-        from PySide6.QtCore import QTimer as _QT
-        def deliver():
-            show_toast(
-                window,
-                f"new tide release: {tag}",
-                action_label="view",
-                on_action=lambda: QDesktopServices.openUrl(_QUrl(url)),
-            )
-        _QT.singleShot(0, deliver)
+    # The update check runs on a plain daemon thread (no Qt event loop), so
+    # the old QTimer.singleShot(0, ...) delivery NEVER fired — the "new
+    # release" toast was silently dead. Marshal to the GUI thread with a
+    # Signal instead: emitting from the worker thread queues the slot onto
+    # the window's (GUI) event loop via AutoConnection.
+    from PySide6.QtCore import QObject as _QObject, Signal as _Signal
+
+    class _UpdateBridge(_QObject):
+        newer = _Signal(str, str)   # tag, url
+
+    def _show_update_toast(tag: str, url: str) -> None:
+        # Only wire the "view" action to a validated GitHub URL (updates.py
+        # already allowlists it; re-check here so this call site is safe on
+        # its own). No URL → informational toast with no clickable action.
+        safe_url = url if url.startswith("https://github.com/") else ""
+        show_toast(
+            window,
+            f"new tide release: {tag}",
+            action_label="view" if safe_url else None,
+            on_action=(lambda: QDesktopServices.openUrl(_QUrl(safe_url))) if safe_url else None,
+        )
+
+    update_bridge = _UpdateBridge()
+    update_bridge.newer.connect(_show_update_toast)
+    window._update_bridge = update_bridge   # keep alive for the app's lifetime
     try:
-        updates.check_in_background(__version__, _on_newer)
+        updates.check_in_background(__version__, update_bridge.newer.emit)
     except Exception:
         pass
     # Expose so the (later) settings dialog can re-configure live.
     window._discord = discord
+    window._lyric_tracker = lyric_tracker
     window._settings = user_settings
     # The SourcePanel was constructed with a placeholder Settings; rebind to
     # the real one so toggles persist.
@@ -411,6 +472,15 @@ def run(argv: list[str] | None = None) -> int:
     # Best-effort teardown so threads + native handles close cleanly.
     try:
         window.visualizer_view.teardown()
+    except Exception:
+        pass
+    # Force-stop the shared audio capture: the ambient pulse holds a
+    # consumer whenever playback is live at quit, and without this the
+    # parec child + FFT thread outlive the window (an orphaned parec kept
+    # the user's monitor stream open after tide exited).
+    try:
+        from . import audio_capture
+        audio_capture.feed().stop()
     except Exception:
         pass
     try:

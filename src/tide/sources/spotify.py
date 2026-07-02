@@ -27,7 +27,7 @@ except ImportError:
     HAVE_SPOTIPY = False
 
 from .. import cache
-from ..auth_spotify import SpotifyTokens, ensure_fresh
+from ..auth_spotify import SpotifyTokens
 from .base import (
     AlbumDetail,
     AlbumEntry,
@@ -185,12 +185,21 @@ class SpotifySource(MusicSource):
     # ---------- auth surface ----------
 
     def is_authenticated(self) -> bool:
+        from .. import auth_spotify
+        if auth_spotify.auth_is_dead():
+            return False
         return bool(self._tokens and self._tokens.refresh_token)
 
     def status_text(self) -> str:
+        # Runs on the GUI thread on every panel repaint — it must never do
+        # network I/O. Read the profile cache passively; probe() fills it
+        # from the panel's background prober.
+        from .. import auth_spotify
+        if auth_spotify.auth_is_dead():
+            return "session expired — sign in to fix"
         if not self.is_authenticated():
             return "sign in via [connect]"
-        me = self._me_cached()
+        me = self._me
         if not me:
             return "signed in"
         product = me.get("product") or "free"
@@ -198,6 +207,12 @@ class SpotifySource(MusicSource):
         if product == "premium":
             return f"signed in as {label} · premium"
         return f"signed in as {label} · {product} (playback needs premium)"
+
+    def probe(self) -> bool:
+        """Fetch/refresh the /me profile so status_text() has something to
+        show. Blocking network — background threads only (the source
+        panel's async prober calls this, mirroring subsonic's ping)."""
+        return self._me_cached() is not None
 
     def is_premium(self) -> bool:
         me = self._me_cached()
@@ -224,9 +239,15 @@ class SpotifySource(MusicSource):
     def access_token(self) -> str:
         return self._token_provider().access_token
 
-    def _me_cached(self, max_age: float = 300.0) -> dict | None:
-        if self._me and (time.time() - self._me_fetched_at) < max_age:
+    def _me_cached(self, max_age: float = 300.0, failure_age: float = 60.0) -> dict | None:
+        age = time.time() - self._me_fetched_at
+        if self._me is not None and age < max_age:
             return self._me
+        if self._me is None and self._me_fetched_at > 0.0 and age < failure_age:
+            # Negative-cached: the last fetch failed moments ago. Without
+            # this, every caller re-hit the API on each call while offline
+            # (the old `if self._me and …` guard was always falsy on None).
+            return None
         try:
             self._me = self._client().me() or None
         except Exception:
@@ -317,20 +338,32 @@ class SpotifySource(MusicSource):
                 thumbnail="",
             ),
         ]
+        # Page through in dev-cap chunks — a single capped call topped out
+        # at 10 playlists, silently hiding the rest of the library.
         try:
-            res = self._client().current_user_playlists(limit=min(limit, DEV_MODE_SEARCH_CAP)) or {}
+            client = self._client()
+            offset = 0
+            page = DEV_MODE_SEARCH_CAP   # >10 → 400 for Dev Mode apps
+            while len(out) - 1 < limit:  # -1: the Liked Songs pseudo-entry
+                res = client.current_user_playlists(limit=page, offset=offset) or {}
+                items = res.get("items", []) or []
+                if not items:
+                    break
+                for item in items:
+                    pid = item.get("id") or ""
+                    if not pid:
+                        continue
+                    out.append(PlaylistEntry(
+                        playlist_id=pid,
+                        title=item.get("name", "") or "",
+                        description=(item.get("description") or "").strip(),
+                        thumbnail=_largest_image(item.get("images")),
+                    ))
+                if len(items) < page or not res.get("next"):
+                    break
+                offset += len(items)
         except Exception:
-            return out
-        for item in res.get("items", []) or []:
-            pid = item.get("id") or ""
-            if not pid:
-                continue
-            out.append(PlaylistEntry(
-                playlist_id=pid,
-                title=item.get("name", "") or "",
-                description=(item.get("description") or "").strip(),
-                thumbnail=_largest_image(item.get("images")),
-            ))
+            return out   # partial result beats none mid-pagination
         return out
 
     def get_playlist(self, playlist_id: str, limit: int = 500) -> PlaylistDetail:

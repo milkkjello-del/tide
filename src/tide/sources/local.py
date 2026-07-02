@@ -201,8 +201,13 @@ class _LocalIndex:
     def search(self, query: str, limit: int = 50) -> list[dict]:
         if not query.strip():
             return []
-        # FTS5 MATCH: quote each token to dodge punctuation pitfalls.
-        terms = " ".join(f'"{t}"*' for t in query.split() if t)
+        # FTS5 MATCH: quote each token to dodge punctuation pitfalls, and
+        # double any embedded quote (FTS5's escape) — a query like
+        # `12" remix` would otherwise terminate the string early and make
+        # the whole MATCH a syntax error.
+        terms = " ".join(
+            '"{}"*'.format(t.replace('"', '""')) for t in query.split() if t
+        )
         if not terms:
             return []
         with self._lock:

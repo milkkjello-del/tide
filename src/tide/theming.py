@@ -118,6 +118,46 @@ def discover_themes() -> dict[str, Theme]:
 _TOKEN_RE = re.compile(r"@([a-z_][a-z0-9_]*)", re.IGNORECASE)
 
 
+# Appended to every theme's stylesheet so the adaptive backdrop (painted
+# behind the app shell) shows through the *structural container* widgets,
+# while real controls stay opaque.
+#
+# Why this works without recoloring controls: inputs, buttons, menus, and
+# item views carry their OWN explicit QSS rules. The selectors below target
+# only named shell panes, bare layout-container QWidgets, and QScrollArea
+# viewports inside the main content stack. Qt's `.QWidget` selector (leading
+# dot) matches ONLY exact QWidget instances — never QListWidget/QPushButton
+# subclasses — so it transparentizes containers and leaves controls alone.
+# QScrollArea is included because the home/explore page is a scroll area;
+# without this it paints a giant flat @bg rectangle over the backdrop.
+#
+# Harmless when the adaptive background is off: CentralBg just paints the flat
+# theme bg behind, so a transparent structural container looks identical to
+# an opaque one.
+_CONTENT_BACKDROP_QSS = """
+QWidget#appSurface,
+QWidget#appUpper,
+QFrame#nav,
+QFrame#now_playing,
+QStackedWidget#contentStack,
+QStackedWidget#contentStack > QWidget,
+QStackedWidget#contentStack QStackedWidget,
+QStackedWidget#contentStack QScrollArea,
+QStackedWidget#contentStack QScrollArea > QWidget,
+QStackedWidget#contentStack QScrollArea > QWidget > QWidget,
+QStackedWidget#contentStack QListView,
+QStackedWidget#contentStack QListWidget,
+QStackedWidget#contentStack QTreeView,
+QStackedWidget#contentStack QListView > QWidget,
+QStackedWidget#contentStack QListWidget > QWidget,
+QStackedWidget#contentStack QTreeView > QWidget,
+QStackedWidget#contentStack #lyricsKaraoke,
+QStackedWidget#contentStack .QWidget {
+    background: transparent;
+}
+"""
+
+
 def _substitute(qss: str, theme: Theme) -> str:
     # tokens come from the [tokens] table plus a couple synthetic ones from
     # [layout] (border, radius, spacing) so QSS can reference them uniformly.
@@ -138,7 +178,8 @@ def _substitute(qss: str, theme: Theme) -> str:
         name = match.group(1)
         return lookups.get(name, match.group(0))
 
-    return _TOKEN_RE.sub(repl, qss)
+    # The backdrop block carries no @tokens, so append after substitution.
+    return _TOKEN_RE.sub(repl, qss) + _CONTENT_BACKDROP_QSS
 
 
 def effective_radius_px(theme: "Theme | None") -> int:
@@ -213,8 +254,9 @@ class ThemeManager(QObject):
         self._themes: dict[str, Theme] = {}
         self._current: Theme | None = None
         # Two override layers. _dynamic_overrides is what the adaptive driver
-        # pushes per-track (accent / accent_alt / bg_alt) — it gets cleared
-        # whenever adaptive turns off or a track changes to "no source".
+        # pushes per-track (accent / accent_alt / ambient_bg) — it gets
+        # cleared whenever adaptive turns off or a track changes to "no
+        # source".
         # _user_overrides is sticky: persisted user settings like the corner
         # radius live here so the adaptive clear doesn't wipe them.
         self._dynamic_overrides: dict[str, str] = {}
@@ -365,7 +407,7 @@ class ThemeManager(QObject):
                 _QT.singleShot(110, _flush)
 
     def clear_accent_override(self) -> None:
-        """Remove the dynamic accent / bg_alt overrides so the base theme
+        """Remove the dynamic accent / ambient backdrop overrides so the base theme
         returns. User overrides (radius etc.) are deliberately preserved —
         they're sticky settings, not per-track."""
         had = bool(self._dynamic_overrides)

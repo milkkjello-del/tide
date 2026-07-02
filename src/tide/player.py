@@ -6,10 +6,30 @@ thread via QueuedConnection-friendly Signals so widgets can bind directly.
 from __future__ import annotations
 
 import locale
+import re
 from enum import Enum
 
 import mpv
 from PySide6.QtCore import QObject, Signal, Slot
+
+
+# Schemes we hand to libmpv. Legit inputs are remote CDN streams (http/https)
+# and local files (a bare filesystem path, or file://). Everything else —
+# notably mpv's own meta-protocols like edl://, lavfi://, memory://, av://,
+# hex://, null:// — is rejected: a compromised/hostile source (or a stream
+# extractor) could return one to make mpv read/compose local files or open
+# unexpected devices. A bare path (no scheme) is allowed as a local file.
+_ALLOWED_MEDIA_SCHEMES = frozenset({"http", "https", "file"})
+_SCHEME_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.\-]*)://")
+
+
+def _is_safe_media_target(target: str) -> bool:
+    if not target:
+        return False
+    m = _SCHEME_RE.match(target)
+    if m is None:
+        return True  # no scheme → treated by mpv as a local file path
+    return m.group(1).lower() in _ALLOWED_MEDIA_SCHEMES
 
 
 def _force_c_numeric_locale() -> None:
@@ -32,6 +52,7 @@ class Player(QObject):
     state_changed = Signal(PlayState)
     position_changed = Signal(float)     # seconds
     duration_changed = Signal(float)     # seconds
+    speed_changed = Signal(float)        # playback rate multiplier (1.0 = normal)
     ended = Signal()
     error = Signal(str)
 
@@ -40,6 +61,7 @@ class Player(QObject):
         _force_c_numeric_locale()
         self._state = PlayState.IDLE
         self._duration = 0.0
+        self._speed = 1.0
         # Cache + readahead tuned for "tide stays smooth when you skip
         # mid-song". mpv plays as soon as the demuxer has its first
         # packet, so the perceived latency is dominated by network round
@@ -111,6 +133,13 @@ class Player(QObject):
 
     @Slot(str)
     def load_url(self, url: str) -> None:
+        # Reject mpv meta-protocols / unexpected schemes before they reach
+        # libmpv. Only http(s), file://, and bare local paths are valid media
+        # targets; anything else is a hostile-source SSRF/local-read attempt.
+        if not _is_safe_media_target(url):
+            self._set_state(PlayState.IDLE)
+            self.error.emit("unsupported stream url")
+            return
         self._duration = 0.0
         self._set_state(PlayState.LOADING)
         # Use the high-level helper — mpv >=0.38 needs 4 positional args
@@ -157,10 +186,17 @@ class Player(QObject):
         default for tide's slowed/sped aesthetic), this also shifts pitch.
         Clamped to 0.25–4.0 — mpv accepts wider but anything outside this
         is unintelligible."""
+        rate = max(0.25, min(4.0, float(value)))
         try:
-            self._mpv["speed"] = max(0.25, min(4.0, float(value)))
+            self._mpv["speed"] = rate
         except Exception:
-            pass
+            return
+        # Publish the effective rate so listeners (e.g. Discord Rich Presence)
+        # can rescale their wall-clock progress math — a 0.5x song really
+        # takes twice as long, so a naive start+duration end timestamp drifts.
+        if rate != self._speed:
+            self._speed = rate
+            self.speed_changed.emit(rate)
 
     @Slot(bool)
     def set_pitch_correction(self, enabled: bool) -> None:
@@ -210,6 +246,10 @@ class Player(QObject):
     @property
     def duration(self) -> float:
         return self._duration
+
+    @property
+    def speed(self) -> float:
+        return self._speed
 
     def _set_state(self, s: PlayState) -> None:
         if s != self._state:

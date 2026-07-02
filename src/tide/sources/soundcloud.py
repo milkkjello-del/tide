@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Iterable
 
 from .. import cache
-from .base import MusicSource, StreamRef, Track
+from .base import MusicSource, StreamRef, Track, safe_int
 from ._ytdlp import (
     best_thumbnail,
     duration_str,
@@ -31,7 +31,7 @@ def _entry_to_track(e: dict) -> Track | None:
         url = f"https://soundcloud.com/-/tracks/{e['id']}"
     if not url:
         return None
-    secs = int(e.get("duration") or 0)
+    secs = safe_int(e.get("duration"))
     return Track(
         video_id=url,
         title=e.get("title", "") or "",

@@ -45,6 +45,21 @@ if TYPE_CHECKING:
 
 RECONNECT_INTERVAL_MS = 30_000
 
+# Discord silently drops presence writes past ~5 per 20s. We coalesce all
+# pushes through a trailing-edge timer spaced at least this far apart so the
+# *latest* desired state (crucially, a pause/clear) always lands even when the
+# user mashes play/pause or skips rapidly.
+MIN_PUSH_INTERVAL_S = 2.0
+
+# Lyric pushes are *sustained* traffic — a line every few seconds for the
+# whole song — unlike the bursty track-change/pause pushes above. Discord's
+# ~5/20s drop threshold is a budget, so sustained spacing must stay under
+# one write per 4s or writes silently stop landing (worst case swallowing a
+# later pause/clear). At 4.5s, fast verses skip lines — the trailing-edge
+# flush sends whichever line is current at fire time — which is the right
+# behavior for a status display: always the *now* line, never a backlog.
+MIN_LYRIC_PUSH_INTERVAL_S = 4.5
+
 
 @dataclass
 class _Activity:
@@ -59,6 +74,13 @@ class _Activity:
     paused: bool
     art_url: str = ""
     source: str = ""
+    # Playback rate (1.0 = normal). Discord fills its progress bar in real
+    # wall-clock time, so a slowed/sped track needs start/end scaled by this
+    # or the bar drifts out of sync with the audio.
+    speed: float = 1.0
+    # Current synced-lyric line (LyricTracker). Empty = no line under the
+    # playhead; the state field falls back to artist · album.
+    lyric: str = ""
 
 
 class DiscordPresence(QObject):
@@ -84,6 +106,15 @@ class DiscordPresence(QObject):
         self._reconnect_timer = QTimer(self)
         self._reconnect_timer.setInterval(RECONNECT_INTERVAL_MS)
         self._reconnect_timer.timeout.connect(self._try_connect)
+
+        # Outbound rate-limit guard. Every push/clear request updates
+        # ``_last_activity`` then asks this trailing-edge timer to flush the
+        # current desired state; the timer reads the latest activity at fire
+        # time, so intermediate states collapse into the final one.
+        self._last_push_monotonic: float = 0.0
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setSingleShot(True)
+        self._flush_timer.timeout.connect(self._flush)
 
     # ---------- lifecycle ----------
 
@@ -112,9 +143,11 @@ class DiscordPresence(QObject):
         self._player.state_changed.connect(self._on_state_changed)
         self._player.duration_changed.connect(self._on_duration_changed)
         self._player.position_changed.connect(self._on_position_changed)
+        self._player.speed_changed.connect(self._on_speed_changed)
 
     def shutdown(self) -> None:
         self._reconnect_timer.stop()
+        self._flush_timer.stop()
         self._disconnect()
 
     @property
@@ -177,7 +210,9 @@ class DiscordPresence(QObject):
         if track is None:
             self._last_activity = None
             self._last_position = 0.0
-            self._clear()
+            # Route through the throttle so the clear can't be the write Discord
+            # drops — _flush() clears when _last_activity is None.
+            self._push_current()
             return
         # Reset cached position — the new track hasn't started, so position 0
         # is the correct anchor if the PLAYING signal beats the first
@@ -194,6 +229,9 @@ class DiscordPresence(QObject):
             paused=False,
             art_url=track.thumbnail or "",
             source=getattr(track, "source", "") or "",
+            # Carry the current playback rate onto the new track — speed is a
+            # global player setting that persists across skips.
+            speed=self._current_speed(),
         )
         # Push title/artist/album only so Discord shows what's coming up.
         # The progress bar appears once audio actually starts.
@@ -206,10 +244,12 @@ class DiscordPresence(QObject):
         if state == PlayState.PLAYING:
             # Anchor Discord's elapsed clock to actual playback position so
             # the resolve+buffer gap doesn't get counted as "elapsed". The
-            # formula ``time.time() - position`` is self-correcting and works
-            # for first-play (position≈0), resume-from-pause (position=where
-            # the user left off), and reconnect-mid-song.
-            self._last_activity.started_at = time.time() - max(0.0, self._last_position)
+            # formula is self-correcting and works for first-play (position≈0),
+            # resume-from-pause (position=where the user left off), and
+            # reconnect-mid-song. Position is divided by speed because Discord
+            # measures elapsed in wall-clock seconds, and it takes
+            # ``position/speed`` real seconds to reach that audio position.
+            self._last_activity.started_at = self._anchor(self._last_position, self._last_activity.speed)
             was_paused = self._last_activity.paused
             self._last_activity.paused = False
             # Always push on PLAYING — either we're setting the start time
@@ -245,16 +285,88 @@ class DiscordPresence(QObject):
         # can anchor started_at to it on resume / reconnect.
         self._last_position = float(secs)
 
+    def _on_speed_changed(self, rate: float) -> None:
+        # A speed change reshapes Discord's progress bar (its end timestamp is
+        # derived from duration/speed), so re-anchor to the current position at
+        # the new rate and re-push. Only meaningful once audio is actually
+        # playing — otherwise started_at stays None and the next PLAYING event
+        # will anchor with the right speed anyway.
+        if self._last_activity is None:
+            return
+        self._last_activity.speed = max(0.01, float(rate))
+        if self._last_activity.started_at is not None and not self._last_activity.paused:
+            self._last_activity.started_at = self._anchor(self._last_position, self._last_activity.speed)
+            self._push_current()
+
+    def set_lyric(self, text: object) -> None:
+        """Live synced-lyric line for the state field; None/"" falls back
+        to artist · album. Fed by LyricTracker (which is gated by the
+        settings toggle upstream, so a disabled feature never gets here
+        with real lines)."""
+        lyric = text.strip() if isinstance(text, str) else ""
+        if self._last_activity is None:
+            return
+        if lyric == self._last_activity.lyric:
+            return
+        self._last_activity.lyric = lyric
+        self._push_current(min_interval=MIN_LYRIC_PUSH_INTERVAL_S)
+
+    def _current_speed(self) -> float:
+        try:
+            return max(0.01, float(self._player.speed))
+        except Exception:
+            return 1.0
+
+    @staticmethod
+    def _anchor(position: float, speed: float) -> float:
+        """Virtual unix start time such that Discord's wall-clock elapsed
+        (now - start) equals the real time taken to reach ``position`` at
+        ``speed``. Pairs with ``end = start + duration/speed`` in the push."""
+        speed = speed if speed > 0 else 1.0
+        return time.time() - max(0.0, position) / speed
+
     # ---------- presence push ----------
 
-    def _push_current(self) -> None:
-        if not self._connected or self._client is None or self._last_activity is None:
+    def _push_current(self, min_interval: float = MIN_PUSH_INTERVAL_S) -> None:
+        """Request that Discord reflect the current ``_last_activity``.
+
+        Coalesced through a trailing-edge timer: if we pushed recently we arm
+        the timer to fire later and return, so a burst of state changes (skip,
+        duration frame, quick play/pause) collapses into a single send of the
+        *final* state. This is what makes pause/skip reliably stop the
+        presence — Discord drops writes past ~5/20s, so without the guard a
+        rapid clear could be the one that gets swallowed, leaving a stale
+        "playing" on the profile.
+
+        ``min_interval`` widens the spacing for lyric-driven pushes (see
+        MIN_LYRIC_PUSH_INTERVAL_S). The pending timer always keeps the
+        *earliest* requested deadline — an urgent pause/skip push shortens a
+        pending lyric wait, never the reverse — and the flush sends the
+        latest full state either way.
+        """
+        if not self._connected:
             return
+        elapsed = time.monotonic() - self._last_push_monotonic
+        delay_ms = int((min_interval - elapsed) * 1000)
+        if delay_ms <= 0:
+            self._flush()
+            return
+        if self._flush_timer.isActive() and self._flush_timer.remainingTime() <= delay_ms:
+            return
+        self._flush_timer.start(delay_ms)
+
+    def _flush(self) -> None:
+        # Cancel any pending trailing fire — whether we were called by the
+        # timer or directly, this send covers the latest state.
+        self._flush_timer.stop()
+        if not self._connected or self._client is None:
+            return
+        self._last_push_monotonic = time.monotonic()
         a = self._last_activity
 
-        # When paused, hide the presence entirely — most users don't want
-        # "paused tide" sitting on their profile while they walked away.
-        if a.paused:
+        # No track, or paused: hide the presence entirely — most users don't
+        # want "paused tide" sitting on their profile while they walked away.
+        if a is None or a.paused:
             self._clear()
             return
 
@@ -262,12 +374,20 @@ class DiscordPresence(QObject):
         # lowercase presence, synthwave gets l33t, etc.
         from . import theming
         details = theming.styled_case((a.title or "tide").strip())
-        state_parts: list[str] = []
-        if a.artists:
-            state_parts.append(theming.styled_case(a.artists))
-        if a.album:
-            state_parts.append(theming.styled_case(a.album))
-        state_text = " · ".join(state_parts) or "—"
+        # A live lyric takes over the state line while one is under the
+        # playhead; artist · album is the resting display (intros, LRC gap
+        # lines, tracks without timed lyrics). The ♪ prefix makes it read
+        # as a lyric rather than a weird second title, and keeps one-word
+        # lines above Discord's 2-char field minimum.
+        if a.lyric:
+            state_text = theming.styled_case(f"♪ {a.lyric}")
+        else:
+            state_parts: list[str] = []
+            if a.artists:
+                state_parts.append(theming.styled_case(a.artists))
+            if a.album:
+                state_parts.append(theming.styled_case(a.album))
+            state_text = " · ".join(state_parts) or "—"
 
         # When started_at is set (audio actually started), include the unix-
         # second start + end timestamps so Discord renders the "0:34 / 3:42"
@@ -282,10 +402,12 @@ class DiscordPresence(QObject):
         else:
             start_s = int(a.started_at)
             if duration_secs > 0:
-                # Clamp so Discord doesn't display "playing past the end" if
-                # the player position somehow exceeds reported duration.
-                end_candidate = int(a.started_at + duration_secs)
-                end_s = end_candidate
+                # End is scaled by playback speed: at 0.5x the song really
+                # ends 2x later in wall-clock time, and Discord's bar advances
+                # in wall-clock, so the end timestamp must stretch to match or
+                # the bar races ahead of the audio.
+                speed = a.speed if a.speed > 0 else 1.0
+                end_s = int(a.started_at + duration_secs / speed)
             else:
                 end_s = 0
 
